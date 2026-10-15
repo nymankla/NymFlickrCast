@@ -91,7 +91,7 @@
   <img id="big" alt="">
   <button class="nav" id="prev" style="left:12px" aria-label="Previous">‹</button>
   <button class="nav" id="next" style="right:12px" aria-label="Next">›</button>
-  <div class="ctl"><button id="slide">▶ Play</button><button id="close">✕ Close</button></div>
+  <div class="ctl"><button id="slide">▶ Play</button><button id="full" title="Full screen (F)" aria-label="Full screen">⛶</button><button id="close">✕ Close</button></div>
   <div class="count" id="count"></div>
 </div>
 <script>
@@ -99,7 +99,7 @@ let slideMs = 8000;
 const $ = id => document.getElementById(id);
 const store = { get: k => { try { return localStorage.getItem(k) } catch { return null } },
   set: (k, v) => { try { localStorage.setItem(k, v) } catch {} } };
-let nsid = '', album = null, photos = [], idx = 0, timer = null, statusTimer = null;
+let casting = null, nsid = '', album = null, photos = [], idx = 0, timer = null, statusTimer = null;
 
 async function api(path, opts) {
   const r = await fetch(path, opts);
@@ -126,7 +126,7 @@ function message(t) { $('msg').textContent = t; $('msg').hidden = !t; }
 
 async function loadAlbums(user) {
   store.set('user', user);
-  album = null; $('castBtn').disabled = true; $('albumBar').hidden = true;
+  album = null; photos = []; updateCastBtn(); $('albumBar').hidden = true;
   $('grid').className = 'grid'; $('grid').replaceChildren();
   message('Loading albums…');
   try {
@@ -146,9 +146,15 @@ async function openAlbum(a) {
     photos = await api(`/api/photos?user=${encodeURIComponent(nsid)}&album=${encodeURIComponent(a.id)}`);
     message(photos.length ? '' : 'No photos in this album.');
     $('grid').replaceChildren(...photos.map((p, i) => card(p.thumb, null, p.title, () => view(i))));
-    $('castBtn').disabled = !photos.length;
+    updateCastBtn();
+    // Keep casting: a running cast switches to this album on the same device.
+    const st = await api('/api/status');
+    if (st.active && st.addr && st.album !== a.id && photos.length) cast({ addr: st.addr, name: st.device });
   } catch (e) { message(e.message); }
 }
+
+// Usable with an album open (to cast it) or while casting (to stop).
+function updateCastBtn() { $('castBtn').disabled = !(album && photos.length) && !casting; }
 
 function view(i) {
   idx = (i + photos.length) % photos.length;
@@ -161,7 +167,19 @@ function setPlaying(on) {
   clearInterval(timer); timer = on ? setInterval(() => view(idx + 1), slideMs) : null;
   $('slide').textContent = on ? '❚❚ Pause' : '▶ Play';
 }
-function closeViewer() { setPlaying(false); $('viewer').hidden = true; }
+function closeViewer() { setPlaying(false); if (fullscreenEl()) exitFullscreen(); $('viewer').hidden = true; }
+
+// Fullscreen, with the webkit-prefixed API for iPad Safari. iPhone Safari has neither, so the button is hidden there.
+const fullscreenEl = () => document.fullscreenElement || document.webkitFullscreenElement;
+const exitFullscreen = () => (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+function toggleFullscreen() {
+  const v = $('viewer');
+  if (fullscreenEl()) exitFullscreen();
+  else (v.requestFullscreen || v.webkitRequestFullscreen).call(v);
+}
+$('full').hidden = !(document.fullscreenEnabled || document.webkitFullscreenEnabled);
+for (const ev of ['fullscreenchange', 'webkitfullscreenchange'])
+  document.addEventListener(ev, () => { $('full').textContent = fullscreenEl() ? '🗗' : '⛶'; $('full').title = fullscreenEl() ? 'Exit full screen (F)' : 'Full screen (F)'; });
 
 async function openCastMenu() {
   const m = $('menu');
@@ -176,7 +194,9 @@ async function openCastMenu() {
     stop.onclick = async () => { m.hidden = true; await api('/api/stop', { method: 'POST' }); pollStatus(); };
     items.push(stop);
   }
-  try {
+  if (!album || !photos.length) {
+    const p = document.createElement('p'); p.textContent = 'Open an album to cast it.'; items.push(p);
+  } else try {
     const devs = await api('/api/devices');
     if (!devs.length) { const p = document.createElement('p'); p.textContent = 'No Cast devices found.'; items.push(p); }
     for (const d of devs) {
@@ -203,6 +223,7 @@ async function pollStatus() {
     const s = await api('/api/status');
     $('status').textContent = s.text;
     $('castBtn').classList.toggle('on', s.active);
+    casting = s.active ? s : null; updateCastBtn();
     if (s.active) statusTimer = setTimeout(pollStatus, 2000);
   } catch { statusTimer = setTimeout(pollStatus, 5000); }
 }
@@ -214,6 +235,7 @@ $('prev').onclick = () => view(idx - 1);
 $('next').onclick = () => view(idx + 1);
 $('slide').onclick = () => setPlaying(!timer);
 $('close').onclick = closeViewer;
+$('full').onclick = toggleFullscreen;
 $('castBtn').onclick = openCastMenu;
 let touchX = null;
 $('viewer').addEventListener('touchstart', e => { touchX = e.touches.length === 1 ? e.touches[0].clientX : null; }, { passive: true });
@@ -227,6 +249,7 @@ document.onkeydown = e => {
   if (e.key === 'ArrowRight') view(idx + 1);
   else if (e.key === 'ArrowLeft') view(idx - 1);
   else if (e.key === 'Escape') closeViewer();
+  else if (e.key === 'f' && !$('full').hidden) toggleFullscreen();
   else if (e.key === ' ') { e.preventDefault(); setPlaying(!timer); }
 };
 

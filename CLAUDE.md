@@ -43,7 +43,7 @@ Casting:
 - Two TLS backends are compiled in: ureq uses rustls with ring, and rust_cast uses aws-lc-rs. `main` must install the ring provider before the first TLS connection, or rustls panics inside the cast thread. A panic in the cast thread is caught and reported in `CAST_STATUS`.
 - Cast threads update the status only through `set_cast_status`, which drops updates from a cast that has been stopped or replaced.
 - The media server logs each request (`media: <ip> GET /img/..`). If a cast's photos never show and there's no log line from the TV's IP, the firewall is blocking it.
-- `CAST_STATUS` holds the JSON that the UI polls at `/api/status`.
+- `CAST_STATUS` holds the JSON that the UI polls at `/api/status`. While a cast is active it also has `device`, `addr` and `album`. `openAlbum` in `ui.html` uses them to restart the cast with the newly opened album on the same device, so casting continues across album changes.
 
 Flickr access uses an API key only, with no OAuth. Only public albums are visible, and only the first 500 albums are listed. Flickr returns some numbers as strings, so read numeric fields with `num()`.
 

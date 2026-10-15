@@ -17,7 +17,7 @@ const API: &str = "https://api.flickr.com/services/rest/";
 const DEFAULT_UI_PORT: u16 = 8080;
 const MEDIA_PORT: u16 = 8765;
 const KEY_FILE: &str = "secrets/flickrkey.txt";
-// shortcut: in-memory cache (~100-200 MB for a big album), lost on restart; move to disk if that matters.
+// shortcut: in-memory cache (~0.5 GB for a 500-photo album at 2048 px), lost on restart; move to disk if that matters.
 const CACHE_TTL: Duration = Duration::from_secs(2 * 60 * 60);
 // Short, so albums added on Flickr show up quickly.
 const ALBUM_CACHE_TTL: Duration = Duration::from_secs(60);
@@ -130,7 +130,7 @@ fn ui_route(req: &tiny_http::Request) -> Res<Resp> {
         "/api/cast" if post => {
             let ids = ALBUMS.lock().unwrap().get(arg("album")).cloned().ok_or("open the album first")?;
             let addr: std::net::SocketAddr = arg("device").parse()?;
-            start_cast(addr, arg("name").to_string(), ids, arg("start").parse().unwrap_or(0));
+            start_cast(addr, arg("name").to_string(), arg("album").to_string(), ids, arg("start").parse().unwrap_or(0));
             json_resp(json!({"ok": true}))
         }
         "/api/stop" if post => {
@@ -261,12 +261,13 @@ fn album_photos(key: &str, nsid: &str, album: &str) -> Res<Value> {
     loop {
         let p = page.to_string();
         let r = flickr(key, "flickr.photosets.getPhotos", &[
-            ("photoset_id", album), ("user_id", nsid), ("extras", "url_q,url_l,url_c,url_z"),
+            ("photoset_id", album), ("user_id", nsid), ("extras", "url_q,url_k,url_h,url_l,url_c,url_z"),
             ("per_page", "500"), ("page", &p), ("media", "photos"),
         ])?;
         for ph in r["photoset"]["photo"].as_array().into_iter().flatten() {
-            // largest size Flickr offers without OAuth, falling back for small originals
-            if let (Some(id), Some(u)) = (ph["id"].as_str(), ["url_l", "url_c", "url_z"].iter().find_map(|k| ph[*k].as_str())) {
+            // Up to 2048 px: a Chromecast shows at most 1920x1080, and bigger files only slow it down.
+            // Sizes above 1024 px are missing when the owner disallows downloads, so fall back.
+            if let (Some(id), Some(u)) = (ph["id"].as_str(), ["url_k", "url_h", "url_l", "url_c", "url_z"].iter().find_map(|k| ph[*k].as_str())) {
                 PHOTOS.lock().unwrap().insert(id.to_string(), u.to_string());
                 photos.push(json!({"id": id, "title": ph["title"], "thumb": ph["url_q"]}));
             }
@@ -352,12 +353,14 @@ fn has_video(ca: Option<&str>) -> bool {
 }
 
 /// Start a slideshow on a Cast device in the background, replacing any running one.
-fn start_cast(addr: std::net::SocketAddr, name: String, ids: Vec<String>, start: usize) {
+/// While active, the status also names the device (`addr`, `device`) and `album`, so the web app can
+/// switch a running cast to another album on the same device.
+fn start_cast(addr: std::net::SocketAddr, name: String, album: String, ids: Vec<String>, start: usize) {
     let generation = CAST_GEN.fetch_add(1, Ordering::SeqCst) + 1;
-    *CAST_STATUS.lock().unwrap() = json!({"active": true, "text": format!("Connecting to {name}…")});
+    *CAST_STATUS.lock().unwrap() = json!({"active": true, "text": format!("Connecting to {name}…"), "device": name, "addr": addr.to_string(), "album": album});
     std::thread::spawn(move || {
         // A panic would otherwise leave the UI on "Connecting…" forever.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cast_slideshow(addr, &name, &ids, start, generation)))
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cast_slideshow(addr, &name, &album, &ids, start, generation)))
             .unwrap_or_else(|_| Err("internal error, see the console".into()));
         let text = match result {
             Ok(()) => "Stopped".to_string(),
@@ -376,7 +379,7 @@ fn set_cast_status(generation: u64, status: Value) {
     }
 }
 
-fn cast_slideshow(addr: std::net::SocketAddr, name: &str, ids: &[String], start: usize, generation: u64) -> Res<()> {
+fn cast_slideshow(addr: std::net::SocketAddr, name: &str, album: &str, ids: &[String], start: usize, generation: u64) -> Res<()> {
     let base = format!("http://{}:{MEDIA_PORT}", local_ip()?);
     // rust_cast has no connect timeout; fail fast with a clear message when the device is unreachable.
     std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5))
@@ -395,7 +398,7 @@ fn cast_slideshow(addr: std::net::SocketAddr, name: &str, ids: &[String], start:
             duration: None,
         };
         dev.media.load(app.transport_id.as_str(), app.session_id.as_str(), &media)?;
-        set_cast_status(generation, json!({"active": true, "text": format!("Casting to {name} · {}/{}", i + 1, ids.len()), "device": name}));
+        set_cast_status(generation, json!({"active": true, "text": format!("Casting to {name} · {}/{}", i + 1, ids.len()), "device": name, "addr": addr.to_string(), "album": album}));
         // Keep the connection alive while the photo is shown.
         // shortcut: receive() blocks until the next message (pings arrive every ~5s), so slides and Stop may lag a few seconds.
         let end = Instant::now() + Duration::from_secs(SLIDE_SECS.load(Ordering::SeqCst));
