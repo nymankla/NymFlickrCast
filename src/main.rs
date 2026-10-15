@@ -133,6 +133,7 @@ fn ui_route(req: &tiny_http::Request) -> Res<Resp> {
     let key = || KEY.lock().unwrap().clone().ok_or("Flickr API key missing");
     Ok(match path {
         "/" => tiny_http::Response::from_string(include_str!("ui.html")).with_header(header("text/html; charset=utf-8")).boxed(),
+        "/ui.js" => tiny_http::Response::from_string(include_str!("ui.js")).with_header(header("text/javascript; charset=utf-8")).boxed(),
         _ if path.starts_with("/img/") => photo(&path[5..])?,
         "/api/config" => json_resp(json!({"version": env!("CARGO_PKG_VERSION"), "defaultUser": DEFAULT_USER, "needKey": KEY.lock().unwrap().is_none(), "slideSecs": SLIDE_SECS.load(Ordering::SeqCst)})),
         "/api/settings" if post => {

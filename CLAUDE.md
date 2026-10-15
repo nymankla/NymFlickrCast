@@ -22,7 +22,7 @@ The app runs until killed. It shouldn't exit because something is missing at sta
 
 ## Architecture
 
-All Rust code is in `src/main.rs`. The whole UI is in `src/ui.html` (vanilla JS, no build step), embedded with `include_str!`, so a rebuild is needed after editing it.
+All Rust code is in `src/main.rs`. The UI is `src/ui.html` (markup and CSS) plus `src/ui.js` (vanilla JS, served at `/ui.js`). Both are embedded with `include_str!`, so a rebuild is needed after editing them. There's no build step: `ui.js` uses `// @ts-check` with JSDoc types, which VS Code checks. The `@typedef`s at its top mirror the `json!` shapes in `main.rs`, so keep them in sync when an API response changes.
 
 Two `tiny_http` servers, both bound to `0.0.0.0` so phones and iPads on the LAN can reach them:
 - **Web app port** (`--port`, default 8080): the page `/`, the JSON API `/api/*`, and `/img/<photo id>` for the in-app preview.

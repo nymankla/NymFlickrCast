@@ -6,58 +6,83 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <title>NymFlickrCast</title>
 <style>
-  :root { --bg:#111; --panel:#1c1c1e; --line:#2c2c2e; --text:#eee; --muted:#999; --accent:#ff0084; }
+  :root { --bg:#0b0b10; --panel:#16161d; --panel2:#20202a; --line:#2b2b36; --text:#f3f3f6; --muted:#9b9bab;
+          --accent:#ff0084; --blue:#0063dc; --glow:0 0 0 3px #ff008455; --radius:14px; color-scheme:dark }
   * { box-sizing:border-box }
-  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.4 system-ui, sans-serif }
-  header { position:sticky; top:0; z-index:5; display:flex; flex-wrap:wrap; gap:8px 12px; align-items:center; padding:10px 16px;
-           background:var(--panel); border-bottom:1px solid var(--line) }
-  header h1 { font-size:17px; margin:0; white-space:nowrap }
-  header h1 b { color:var(--accent) }
-  form { display:flex; gap:6px; flex:1; min-width:0 }
-  input, button { font:inherit; font-size:16px; min-height:40px; touch-action:manipulation; color:var(--text); background:#2c2c2e; border:1px solid #3a3a3c; border-radius:6px; padding:6px 10px }
+  body { margin:0; min-height:100vh; color:var(--text); font:15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+         background:radial-gradient(900px 500px at 10% -10%, #0063dc22, transparent 60%),
+                    radial-gradient(800px 500px at 100% 0%, #ff008420, transparent 60%), var(--bg) fixed }
+  header { position:sticky; top:0; z-index:5; display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center;
+           padding:10px 16px; padding-top:max(10px, env(safe-area-inset-top));
+           background:#16161dcc; backdrop-filter:blur(16px) saturate(1.4); -webkit-backdrop-filter:blur(16px) saturate(1.4);
+           border-bottom:1px solid var(--line) }
+  /* Flickr's blue and pink dots */
+  header h1 { font-size:19px; font-weight:800; letter-spacing:-.02em; margin:0; white-space:nowrap; display:flex; align-items:center }
+  header h1::before { content:''; width:11px; height:11px; border-radius:50%; background:var(--blue); box-shadow:14px 0 var(--accent); margin-right:24px }
+  header h1 b { background:linear-gradient(90deg, var(--blue), var(--accent)); -webkit-background-clip:text; background-clip:text; color:transparent }
+  form { display:flex; gap:6px; flex:0 1 auto; min-width:0 }
+  input, button { font:inherit; font-size:16px; min-height:40px; touch-action:manipulation; color:var(--text); background:var(--panel2);
+                  border:1px solid var(--line); border-radius:10px; padding:6px 12px; transition:border-color .15s, background .15s, box-shadow .15s, transform .1s }
   input { min-width:0; flex:0 1 240px }
-  button { cursor:pointer }
-  button:hover { border-color:#666 }
+  input:focus { outline:none; border-color:var(--accent); box-shadow:var(--glow) }
+  button { cursor:pointer; font-weight:600 }
+  button:hover { border-color:#4a4a5a; background:#2a2a36 }
+  button:active { transform:scale(.97) }
+  button:focus-visible { outline:none; box-shadow:var(--glow) }
+  #userForm button, #play, #keyForm button { background:linear-gradient(135deg, var(--accent), #c4006a); border-color:transparent; color:#fff }
+  #userForm button:hover, #play:hover, #keyForm button:hover { filter:brightness(1.12) }
   #status { color:var(--muted); font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; flex:1; min-width:0 }
-  form { flex:0 1 auto }
-  #castBtn { display:flex; padding:8px; background:none; border:none; margin-left:auto }
-  #castBtn svg { width:26px; height:26px; fill:var(--muted) }
-  #castBtn.on svg { fill:var(--accent) }
-  #castBtn:disabled { opacity:.35; cursor:default }
-  #menu { position:absolute; right:8px; top:100%; width:min(280px, calc(100vw - 16px)); background:var(--panel); border:1px solid var(--line);
-          border-radius:8px; padding:6px; box-shadow:0 8px 24px #000a }
-  #menu button { display:block; min-height:44px; width:100%; text-align:left; margin:2px 0; background:none; border-color:transparent }
-  #menu button:hover { background:#2c2c2e }
-  #menu p { margin:6px 10px; color:var(--muted) }
-  main { padding:16px }
-  .bar { display:flex; gap:12px; align-items:center; margin-bottom:14px }
-  .bar h2 { margin:0; font-size:18px }
+  #castBtn { display:flex; padding:8px; background:none; border:none; margin-left:auto; border-radius:50% }
+  #castBtn:hover { background:var(--panel2) }
+  #castBtn svg { width:26px; height:26px; fill:var(--muted); transition:fill .2s }
+  #castBtn.on svg { fill:var(--accent); filter:drop-shadow(0 0 6px var(--accent)) }
+  #castBtn:disabled { opacity:.35; cursor:default; background:none }
+  #menu { position:absolute; right:8px; top:100%; margin-top:6px; width:min(290px, calc(100vw - 16px)); background:#1c1c25ee;
+          backdrop-filter:blur(16px); -webkit-backdrop-filter:blur(16px); border:1px solid var(--line); border-radius:var(--radius);
+          padding:6px; box-shadow:0 16px 40px #000c }
+  #menu button { display:block; min-height:44px; width:100%; text-align:left; margin:2px 0; background:none; border-color:transparent; border-radius:10px }
+  #menu button:hover { background:#ff008422; color:#fff }
+  #menu p { margin:8px 12px; color:var(--muted) }
+  main { padding:20px; max-width:1600px; margin:0 auto }
+  .bar { display:flex; gap:12px; align-items:center; margin-bottom:18px }
+  .bar h2 { margin:0; font-size:24px; font-weight:800; letter-spacing:-.02em; flex:1; min-width:0 }
   .delay { color:var(--muted); white-space:nowrap }
   #delay { flex:none; width:5.5em; margin:0 4px }
-  .grid { display:grid; gap:12px; grid-template-columns:repeat(auto-fill, minmax(160px, 1fr)) }
-  .card { background:var(--panel); border-radius:8px; overflow:hidden; cursor:pointer; border:1px solid transparent; padding:0; text-align:left }
-  .card:hover, .card:focus-visible { border-color:var(--accent) }
-  .card img { display:block; width:100%; aspect-ratio:1; object-fit:cover; background:#222 }
-  .card div { padding:8px 10px }
-  .card small { color:var(--muted) }
-  .photos { grid-template-columns:repeat(auto-fill, minmax(100px, 1fr)); gap:6px }
-  .photos .card { border-radius:4px }
-  #msg { color:var(--muted) }
-  #viewer { position:fixed; inset:0; touch-action:pan-y pinch-zoom; z-index:10; background:#000; display:flex; align-items:center; justify-content:center }
-  #viewer img { max-width:100%; max-height:100%; object-fit:contain }
+  .grid { display:grid; gap:16px; grid-template-columns:repeat(auto-fill, minmax(190px, 1fr)) }
+  .card { position:relative; background:var(--panel); border-radius:var(--radius); overflow:hidden; cursor:pointer; border:1px solid var(--line);
+          padding:0; text-align:left; font-weight:400; box-shadow:0 2px 8px #0006; transition:transform .25s, box-shadow .25s, border-color .25s }
+  .card img { display:block; width:100%; aspect-ratio:1; object-fit:cover; background:var(--panel2); transition:transform .5s }
+  .card:hover, .card:focus-visible { border-color:var(--accent); box-shadow:0 14px 32px #000a, 0 0 0 1px var(--accent); background:var(--panel) }
+  .card div { padding:10px 12px 12px; font-weight:650 }
+  .card small { color:var(--muted); font-weight:400 }
+  .photos { grid-template-columns:repeat(auto-fill, minmax(120px, 1fr)); gap:8px }
+  .photos .card { border-radius:8px }
+  #msg { color:var(--muted); text-align:center; margin:48px 0; font-size:17px }
+  @media (prefers-reduced-motion:no-preference) {
+    .card:hover { transform:translateY(-4px) }
+    .card:hover img { transform:scale(1.06) }
+  }
+  #viewer { position:fixed; inset:0; touch-action:pan-y pinch-zoom; z-index:10; background:radial-gradient(circle at 50% 40%, #16161d, #000 70%);
+            display:flex; align-items:center; justify-content:center }
+  #viewer img { max-width:100%; max-height:100%; object-fit:contain; box-shadow:0 20px 60px #000 }
+  #viewer button { background:#0008; backdrop-filter:blur(10px); -webkit-backdrop-filter:blur(10px); border-color:#ffffff22 }
+  #viewer button:hover { background:#ff008488 }
   #viewer .ctl { position:absolute; display:flex; gap:8px; top:max(12px, env(safe-area-inset-top)); right:12px }
-  #viewer .nav { position:absolute; top:50%; transform:translateY(-50%); font-size:28px; min-width:48px; min-height:64px; background:#0008 }
-  #viewer .count { position:absolute; bottom:10px; right:14px; color:var(--muted); font-size:13px }
+  #viewer .nav { position:absolute; top:50%; transform:translateY(-50%); font-size:30px; width:52px; height:52px; padding:0; border-radius:50% }
+  #viewer .nav:active { transform:translateY(-50%) scale(.94) }
+  #viewer .count { position:absolute; bottom:max(14px, env(safe-area-inset-bottom)); left:50%; transform:translateX(-50%); font-size:13px;
+                   padding:4px 12px; border-radius:99px; background:#0008; color:#ddd; font-variant-numeric:tabular-nums }
   @media (max-width:600px) {
     main { padding:12px }
-    .grid { grid-template-columns:repeat(auto-fill, minmax(140px, 1fr)) }
-    .photos { grid-template-columns:repeat(auto-fill, minmax(90px, 1fr)) }
+    .grid { grid-template-columns:repeat(auto-fill, minmax(150px, 1fr)); gap:12px }
+    .photos { grid-template-columns:repeat(auto-fill, minmax(95px, 1fr)); gap:5px }
     form { order:3; flex:1 1 100% } input { flex:1 }
-    .bar { flex-wrap:wrap }
+    .bar { flex-wrap:wrap } .bar h2 { flex-basis:100%; order:-1 }
   }
-  #keyForm { display:block; max-width:520px; margin:24px auto; background:var(--panel); padding:16px 20px; border-radius:8px }
-  #keyForm h2 { margin:0 0 8px; font-size:18px }
-  #keyForm input { width:100%; margin:8px 0 }
+  #keyForm { display:block; max-width:540px; margin:40px auto; background:var(--panel); padding:22px 24px; border-radius:var(--radius);
+             border:1px solid var(--line); box-shadow:0 0 0 1px #ff008433, 0 20px 50px #000a }
+  #keyForm h2 { margin:0 0 8px; font-size:20px }
+  #keyForm input { width:100%; margin:10px 0 }
   #keyForm a { color:var(--accent) }
   #keyMsg { color:var(--accent); min-height:1.4em; margin:6px 0 0 }
   [hidden] { display:none !important }
@@ -94,203 +119,6 @@
   <div class="ctl"><button id="slide">▶ Play</button><button id="full" title="Full screen (F)" aria-label="Full screen">⛶</button><button id="close">✕ Close</button></div>
   <div class="count" id="count"></div>
 </div>
-<script>
-let slideMs = 4000;
-const $ = id => document.getElementById(id);
-const store = { get: k => { try { return localStorage.getItem(k) } catch { return null } },
-  set: (k, v) => { try { localStorage.setItem(k, v) } catch {} } };
-let casting = null, nsid = '', album = null, photos = [], idx = 0, timer = null, statusTimer = null;
-
-async function api(path, opts) {
-  const r = await fetch(path, opts);
-  const j = await r.json();
-  if (!r.ok) throw new Error(j.error || r.statusText);
-  return j;
-}
-function card(thumb, title, sub, onClick) {
-  const b = document.createElement('button');
-  b.className = 'card';
-  const img = document.createElement('img');
-  img.loading = 'lazy'; img.alt = ''; if (thumb) img.src = thumb;
-  b.append(img);
-  if (title !== null) {
-    const d = document.createElement('div');
-    d.textContent = title;
-    if (sub) { const s = document.createElement('small'); s.textContent = sub; d.append(document.createElement('br'), s); }
-    b.append(d);
-  } else b.title = sub;
-  b.onclick = onClick;
-  return b;
-}
-function message(t) { $('msg').textContent = t; $('msg').hidden = !t; }
-
-async function loadAlbums(user) {
-  store.set('user', user);
-  album = null; photos = []; updateCastBtn(); $('albumBar').hidden = true;
-  $('grid').className = 'grid'; $('grid').replaceChildren();
-  message('Loading albums…');
-  try {
-    const r = await api('/api/albums?user=' + encodeURIComponent(user));
-    nsid = r.nsid;
-    message(r.albums.length ? '' : 'No public albums.');
-    $('grid').replaceChildren(...r.albums.map(a => card(a.thumb, a.title,
-      `${a.count} photos · ${new Date(a.created * 1000).toLocaleDateString()}`, () => openAlbum(a))));  } catch (e) { message(e.message); }
-}
-
-async function openAlbum(a) {
-  album = a; idx = 0;
-  $('albumTitle').textContent = a.title; $('albumBar').hidden = false;
-  $('grid').className = 'grid photos'; $('grid').replaceChildren();
-  message('Loading photos…');
-  try {
-    const list = await api(`/api/photos?user=${encodeURIComponent(nsid)}&album=${encodeURIComponent(a.id)}`);
-    if (album !== a) return; // another album was opened meanwhile
-    photos = list;
-    message(photos.length ? '' : 'No photos in this album.');
-    $('grid').replaceChildren(...photos.map((p, i) => card(p.thumb, null, p.title, () => view(i))));
-    updateCastBtn();
-    // Keep casting: a running cast switches to this album on the same device.
-    const st = await api('/api/status');
-    if (album !== a) return;
-    if (st.active && st.addr && st.album !== a.id && photos.length) cast({ addr: st.addr, name: st.device });
-  } catch (e) { message(e.message); }
-}
-
-// Usable with an album open (to cast it) or while casting (to stop).
-function updateCastBtn() { $('castBtn').disabled = !(album && photos.length) && !casting; }
-
-function view(i) {
-  idx = (i + photos.length) % photos.length;
-  $('viewer').hidden = false;
-  $('big').src = '/img/' + photos[idx].id;
-  $('big').alt = photos[idx].title || '';
-  $('count').textContent = `${idx + 1} / ${photos.length}`;
-}
-function setPlaying(on) {
-  clearInterval(timer); timer = on ? setInterval(() => view(idx + 1), slideMs) : null;
-  $('slide').textContent = on ? '❚❚ Pause' : '▶ Play';
-}
-function closeViewer() { setPlaying(false); if (fullscreenEl()) exitFullscreen(); $('viewer').hidden = true; }
-
-// Fullscreen, with the webkit-prefixed API for iPad Safari. iPhone Safari has neither, so the button is hidden there.
-const fullscreenEl = () => document.fullscreenElement || document.webkitFullscreenElement;
-const exitFullscreen = () => (document.exitFullscreen || document.webkitExitFullscreen).call(document);
-function toggleFullscreen() {
-  const v = $('viewer');
-  if (fullscreenEl()) exitFullscreen();
-  else (v.requestFullscreen || v.webkitRequestFullscreen).call(v);
-}
-$('full').hidden = !(document.fullscreenEnabled || document.webkitFullscreenEnabled);
-for (const ev of ['fullscreenchange', 'webkitfullscreenchange'])
-  document.addEventListener(ev, () => { $('full').textContent = fullscreenEl() ? '🗗' : '⛶'; $('full').title = fullscreenEl() ? 'Exit full screen (F)' : 'Full screen (F)'; });
-
-async function openCastMenu() {
-  const m = $('menu');
-  if (!m.hidden) { m.hidden = true; return; }
-  m.hidden = false;
-  m.innerHTML = '<p>Searching for Cast devices…</p>';
-  const items = [];
-  const st = await api('/api/status');
-  if (st.active) {
-    const stop = document.createElement('button');
-    stop.textContent = '■ Stop casting';
-    stop.onclick = async () => { m.hidden = true; await api('/api/stop', { method: 'POST' }); pollStatus(); };
-    items.push(stop);
-  }
-  if (!album || !photos.length) {
-    const p = document.createElement('p'); p.textContent = 'Open an album to cast it.'; items.push(p);
-  } else try {
-    const devs = await api('/api/devices');
-    if (!devs.length) { const p = document.createElement('p'); p.textContent = 'No Cast devices found.'; items.push(p); }
-    for (const d of devs) {
-      const b = document.createElement('button');
-      b.textContent = '📺 ' + d.name;
-      b.onclick = () => cast(d);
-      items.push(b);
-    }
-  } catch (e) { const p = document.createElement('p'); p.textContent = e.message; items.push(p); }
-  m.replaceChildren(...items);
-}
-
-async function cast(d) {
-  $('menu').hidden = true;
-  const start = $('viewer').hidden ? 0 : idx;
-  const q = new URLSearchParams({ device: d.addr, name: d.name, album: album.id, start });
-  try { await api('/api/cast?' + q, { method: 'POST' }); } catch (e) { $('status').textContent = e.message; }
-  pollStatus();
-}
-
-async function pollStatus() {
-  clearTimeout(statusTimer);
-  try {
-    const s = await api('/api/status');
-    $('status').textContent = s.text;
-    $('castBtn').classList.toggle('on', s.active);
-    casting = s.active ? s : null; updateCastBtn();
-    statusTimer = setTimeout(pollStatus, s.active ? 2000 : 10000); // idle: notice casts started elsewhere
-  } catch { statusTimer = setTimeout(pollStatus, 5000); }
-}
-
-$('userForm').onsubmit = e => { e.preventDefault(); const u = $('user').value.trim(); if (u) loadAlbums(u); };
-$('back').onclick = () => loadAlbums(store.get('user') || $('user').value);
-$('play').onclick = () => { view(idx); setPlaying(true); };
-$('prev').onclick = () => view(idx - 1);
-$('next').onclick = () => view(idx + 1);
-$('slide').onclick = () => setPlaying(!timer);
-$('close').onclick = closeViewer;
-$('full').onclick = toggleFullscreen;
-$('castBtn').onclick = openCastMenu;
-let touchX = null;
-$('viewer').addEventListener('touchstart', e => { touchX = e.touches.length === 1 ? e.touches[0].clientX : null; }, { passive: true });
-$('viewer').addEventListener('touchend', e => {
-  if (touchX === null) return;
-  const dx = e.changedTouches[0].clientX - touchX; touchX = null;
-  if (Math.abs(dx) > 50) view(idx + (dx < 0 ? 1 : -1));
-});
-document.onkeydown = e => {
-  if ($('viewer').hidden) return;
-  if (e.key === 'ArrowRight') view(idx + 1);
-  else if (e.key === 'ArrowLeft') view(idx - 1);
-  else if (e.key === 'Escape') closeViewer();
-  else if (e.key === 'f' && !$('full').hidden) toggleFullscreen();
-  else if (e.key === ' ') { e.preventDefault(); setPlaying(!timer); }
-};
-
-$('keyForm').onsubmit = async e => {
-  e.preventDefault();
-  $('keyMsg').textContent = 'Checking key with Flickr…';
-  try {
-    await api('/api/key?key=' + encodeURIComponent($('key').value.trim()), { method: 'POST' });
-    $('keyForm').hidden = true;
-    start();
-  } catch (err) { $('keyMsg').textContent = err.message; }
-};
-
-function showDelay(secs) { slideMs = secs * 1000; $('delay').value = secs; }
-$('delay').onchange = async () => {
-  try {
-    showDelay((await api('/api/settings?slideSecs=' + Math.round(+$('delay').value), { method: 'POST' })).slideSecs);
-    if (timer) setPlaying(true);
-  } catch (e) { $('status').textContent = e.message; }
-};
-
-// Ask for whatever the server is missing before loading albums.
-async function start() {
-  let cfg;
-  try {
-    cfg = await api('/api/config');
-    showDelay(cfg.slideSecs);
-    if (cfg.needKey) {
-      $('keyForm').hidden = false; message(''); $('key').focus();
-      return;
-    }
-  } catch (e) { message('Cannot reach the NymFlickrCast server: ' + e.message); return; }
-  message('Enter a Flickr username to see the albums.');
-  const initial = new URLSearchParams(location.search).get('user') || store.get('user') || cfg.defaultUser;
-  if (initial) { $('user').value = initial; loadAlbums(initial); }
-}
-start();
-pollStatus();
-</script>
+<script src="/ui.js"></script>
 </body>
 </html>

@@ -70,7 +70,7 @@ cargo build
 cargo test
 ```
 
-All server code is in `src/main.rs`. The web page is `src/ui.html`, compiled into the binary. [CLAUDE.md](CLAUDE.md) describes the architecture in more detail.
+All server code is in `src/main.rs`. The web page is `src/ui.html` and `src/ui.js` (type-checked JavaScript via JSDoc, no build step), compiled into the binary. [CLAUDE.md](CLAUDE.md) describes the architecture in more detail.
 
 ## License
 
