@@ -1,4 +1,4 @@
-//! Flickr → Chromecast bridge. A web app (UI_PORT) to browse albums, preview them
+//! Flickr → Chromecast bridge. A web app (`--port`, default 8080) to browse albums, preview them
 //! and cast them; a media server (MEDIA_PORT) the Chromecast fetches photos from.
 
 use rust_cast::channels::heartbeat::HeartbeatResponse;
@@ -14,11 +14,13 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 const API: &str = "https://api.flickr.com/services/rest/";
-const UI_PORT: u16 = 8080;
+const DEFAULT_UI_PORT: u16 = 8080;
 const MEDIA_PORT: u16 = 8765;
 const KEY_FILE: &str = "secrets/flickrkey.txt";
 // shortcut: in-memory cache (~100-200 MB for a big album), lost on restart; move to disk if that matters.
 const CACHE_TTL: Duration = Duration::from_secs(2 * 60 * 60);
+// Short, so albums added on Flickr show up quickly.
+const ALBUM_CACHE_TTL: Duration = Duration::from_secs(60);
 
 type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 type Resp = tiny_http::Response<std::io::Cursor<Vec<u8>>>;
@@ -40,12 +42,20 @@ fn main() -> Res<()> {
     // ureq brings rustls with ring and rust_cast with aws-lc-rs; with both compiled in, rustls
     // can't pick a provider by itself and panics on the first TLS connection to a Cast device.
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let mut url = format!("http://localhost:{UI_PORT}/");
-    if let Some(user) = std::env::args().nth(1) {
+    let (ui_port, user) = match parse_args(std::env::args().skip(1)) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("{e}
+Usage: nym_flickr_cast [--port N] [flickr-username-or-NSID]");
+            std::process::exit(2);
+        }
+    };
+    let mut url = format!("http://localhost:{ui_port}/");
+    if let Some(user) = user {
         url += &format!("?user={}", url::form_urlencoded::byte_serialize(user.as_bytes()).collect::<String>());
     }
-    if std::net::TcpListener::bind(("0.0.0.0", UI_PORT)).is_err() {
-        println!("Port {UI_PORT} is in use, so NymFlickrCast is probably already running. Opening {url}");
+    if std::net::TcpListener::bind(("0.0.0.0", ui_port)).is_err() {
+        println!("Port {ui_port} is in use, so NymFlickrCast is probably already running. Opening {url}");
         open_browser(&url);
         return Ok(());
     }
@@ -66,11 +76,11 @@ fn main() -> Res<()> {
             None => Ok(text(404, "not found")),
         }
     }))?;
-    serve(UI_PORT, Arc::new(ui_route))?;
+    serve(ui_port, Arc::new(ui_route))?;
 
-    println!("NymFlickrCast running at {url} (Ctrl+C to quit)");
+    println!("NymFlickrCast {} running at {url} (Ctrl+C to quit)", env!("CARGO_PKG_VERSION"));
     if let Ok(ip) = local_ip() {
-        println!("On a phone/iPad on the same Wi-Fi: http://{ip}:{UI_PORT}/");
+        println!("On a phone/iPad on the same Wi-Fi: http://{ip}:{ui_port}/");
     }
     open_browser(&url);
     loop {
@@ -106,7 +116,7 @@ fn ui_route(req: &tiny_http::Request) -> Res<Resp> {
     Ok(match path {
         "/" => tiny_http::Response::from_string(include_str!("ui.html")).with_header(header("text/html; charset=utf-8")),
         _ if path.starts_with("/img/") => photo(&path[5..])?,
-        "/api/config" => json_resp(json!({"needKey": KEY.lock().unwrap().is_none(), "slideSecs": SLIDE_SECS.load(Ordering::SeqCst)})),
+        "/api/config" => json_resp(json!({"version": env!("CARGO_PKG_VERSION"), "needKey": KEY.lock().unwrap().is_none(), "slideSecs": SLIDE_SECS.load(Ordering::SeqCst)})),
         "/api/settings" if post => {
             let secs: u64 = arg("slideSecs").parse().map_err(|_| "delay must be a whole number of seconds")?;
             SLIDE_SECS.store(secs.clamp(2, 3600), Ordering::SeqCst);
@@ -130,6 +140,26 @@ fn ui_route(req: &tiny_http::Request) -> Res<Resp> {
         }
         _ => text(404, "not found"),
     })
+}
+
+/// `[--port N | -p N] [user]` → (web app port, optional Flickr user to open).
+fn parse_args(mut args: impl Iterator<Item = String>) -> Result<(u16, Option<String>), String> {
+    let (mut port, mut user) = (DEFAULT_UI_PORT, None);
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--port" | "-p" => {
+                let v = args.next().ok_or("--port needs a number")?;
+                port = v.parse().ok().filter(|p| *p != 0).ok_or(format!("invalid port: {v}"))?;
+                if port == MEDIA_PORT {
+                    return Err(format!("port {MEDIA_PORT} is used for the Chromecast photo server"));
+                }
+            }
+            _ if a.starts_with('-') => return Err(format!("unknown option: {a}")),
+            _ if user.is_none() => user = Some(a),
+            _ => return Err(format!("unexpected argument: {a}")),
+        }
+    }
+    Ok((port, user))
 }
 
 /// The key file may hold labels/secret too; the API key is the 32-hex-char token.
@@ -187,7 +217,23 @@ fn num(v: &Value) -> u64 {
     v.as_u64().or_else(|| v.as_str()?.parse().ok()).unwrap_or(0)
 }
 
+/// Album list per user, kept for ALBUM_CACHE_TTL.
+static ALBUM_CACHE: LazyLock<Mutex<HashMap<String, (Instant, Value)>>> = LazyLock::new(Default::default);
+
 fn albums(key: &str, user: &str) -> Res<Value> {
+    if let Some((t, v)) = ALBUM_CACHE.lock().unwrap().get(user) {
+        if t.elapsed() < ALBUM_CACHE_TTL {
+            return Ok(v.clone());
+        }
+    }
+    let v = fetch_albums(key, user)?;
+    let mut cache = ALBUM_CACHE.lock().unwrap();
+    cache.retain(|_, (t, _)| t.elapsed() < ALBUM_CACHE_TTL);
+    cache.insert(user.to_string(), (Instant::now(), v.clone()));
+    Ok(v)
+}
+
+fn fetch_albums(key: &str, user: &str) -> Res<Value> {
     let nsid = if user.contains('@') {
         user.to_string()
     } else {
@@ -332,6 +378,9 @@ fn set_cast_status(generation: u64, status: Value) {
 
 fn cast_slideshow(addr: std::net::SocketAddr, name: &str, ids: &[String], start: usize, generation: u64) -> Res<()> {
     let base = format!("http://{}:{MEDIA_PORT}", local_ip()?);
+    // rust_cast has no connect timeout; fail fast with a clear message when the device is unreachable.
+    std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+        .map_err(|e| format!("can't reach {name} at {addr}: {e}"))?;
     let dev = CastDevice::connect_without_host_verification(addr.ip().to_string(), addr.port())?;
     dev.connection.connect("receiver-0")?;
     dev.heartbeat.ping()?;
@@ -384,6 +433,27 @@ mod tests {
         assert_eq!(parse_key("nothing here"), None);
         assert_eq!(num(&serde_json::json!("42")), 42);
         assert_eq!(num(&serde_json::json!(7)), 7);
+    }
+
+    #[test]
+    fn cli_args() {
+        let p = |a: &[&str]| parse_args(a.iter().map(|s| s.to_string()));
+        assert_eq!(p(&[]), Ok((8080, None)));
+        assert_eq!(p(&["--port", "9000", "bob"]), Ok((9000, Some("bob".into()))));
+        assert_eq!(p(&["bob", "-p", "9001"]), Ok((9001, Some("bob".into()))));
+        assert!(p(&["--port"]).is_err());
+        assert!(p(&["--port", "abc"]).is_err());
+        assert!(p(&["--port", "0"]).is_err());
+        assert!(p(&["--port", "8765"]).is_err());
+        assert!(p(&["--bogus"]).is_err());
+        assert!(p(&["a", "b"]).is_err());
+    }
+
+    #[test]
+    fn album_cache_hit() {
+        let v = json!({"nsid": "x@N00", "albums": []});
+        ALBUM_CACHE.lock().unwrap().insert("cached-user".into(), (Instant::now(), v.clone()));
+        assert_eq!(albums("no-key", "cached-user").unwrap(), v); // no Flickr call needed
     }
 
     #[test]

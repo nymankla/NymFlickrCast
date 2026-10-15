@@ -21,12 +21,12 @@ will run a tiny local HTTP server to proxy or serve the image queue.
 ## Run
 
 ```
-cargo run --release -- [flickr-username-or-NSID]
+cargo run --release -- [--port N] [flickr-username-or-NSID]
 ```
 
-Needs the Flickr API key in `secrets/flickrkey.txt`. Opens the web app at `http://localhost:8080/`; the console also prints
+Needs the Flickr API key in `secrets/flickrkey.txt`. Opens the web app at `http://localhost:8080/` (`--port N` to use another port); the console also prints
 the LAN address to use from a phone or iPad on the same Wi-Fi.
 
 * Browse albums (newest first), tap an album for its photos, tap a photo to preview (swipe / arrow keys, ▶ for slideshow).
 * The Cast icon (top right) lists Chromecasts; pick one to cast the open album from the current photo. Tap it again to stop.
-* Ports: 8080 = web app, 8765 = photo URLs the Chromecast fetches. Windows Firewall must allow both on the private network.
+* Ports: 8080 (or `--port`) = web app, 8765 = photo URLs the Chromecast fetches. Windows Firewall must allow both on the private network.

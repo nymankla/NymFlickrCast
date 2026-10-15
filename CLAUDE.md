@@ -12,20 +12,20 @@ A Rust bridge from Flickr to Chromecast. It is a single binary that serves a web
 cargo build
 cargo test                          # unit tests (no network needed)
 cargo test cache_hit_and_expiry     # single test
-cargo run --release -- [user]       # optional Flickr username or NSID (e.g. 35067687@N04) prefills the UI
+cargo run --release -- [--port N] [user]   # web app port (default 8080); optional Flickr username or NSID (e.g. 35067687@N04) prefills the UI
 powershell -ExecutionPolicy Bypass -File .\release.ps1   # release build → dist\NymFlickrCast.zip (exe, readme, secrets\ incl. the API key)
 ```
 
 The app needs the Flickr API key in `secrets/flickrkey.txt`. `parse_key` takes the first 32-hex-char token, so the file may also hold labels or the secret. Don't print the contents of this file. `secrets/` is gitignored.
 
-The app runs until killed. It shouldn't exit because something is missing at startup; it asks in the web app instead. If the key is missing or Flickr rejects it, `KEY` stays `None`, `/api/config` reports `needKey`, and `ui.html` shows a key form that posts to `/api/key`, which checks the key with Flickr and saves it to `KEY_FILE`. If port 8080 is already in use, the app assumes it is already running, opens the browser on it and exits.
+The app runs until killed. It shouldn't exit because something is missing at startup; it asks in the web app instead. If the key is missing or Flickr rejects it, `KEY` stays `None`, `/api/config` reports `needKey`, and `ui.html` shows a key form that posts to `/api/key`, which checks the key with Flickr and saves it to `KEY_FILE`. If the web app port is already in use, the app assumes it is already running, opens the browser on it and exits.
 
 ## Architecture
 
 All Rust code is in `src/main.rs`. The whole UI is in `src/ui.html` (vanilla JS, no build step), embedded with `include_str!`, so a rebuild is needed after editing it.
 
 Two `tiny_http` servers, both bound to `0.0.0.0` so phones and iPads on the LAN can reach them:
-- **UI_PORT 8080**: the page `/`, the JSON API `/api/*`, and `/img/<photo id>` for the in-app preview.
+- **Web app port** (`--port`, default 8080): the page `/`, the JSON API `/api/*`, and `/img/<photo id>` for the in-app preview.
 - **MEDIA_PORT 8765**: only `/img/<photo id>`. The Chromecast fetches photos from here, at `http://<local_ip()>:8765/img/<id>`.
 
 Data flow and global state (statics in `main.rs`):
@@ -33,7 +33,7 @@ Data flow and global state (statics in `main.rs`):
 - `/api/photos?user=<nsid>&album=` pages through `flickr.photosets.getPhotos` and fills two maps:
   - `PHOTOS` (photo id → large Flickr URL). `/img` only serves ids in this map, so the server is not an open proxy.
   - `ALBUMS` (album id → ordered photo ids). `/api/cast` reads this, so an album must have been opened in the UI before it can be cast.
-- `fetch` keeps an in-memory `CACHE` of photo bytes for 2 hours (`CACHE_TTL`). Expired entries are pruned when new ones are inserted.
+- `fetch` keeps an in-memory `CACHE` of photo bytes for 2 hours (`CACHE_TTL`). `albums` caches each user's album list for 1 minute (`ALBUM_CACHE_TTL`), kept short so new Flickr albums show up quickly. Expired entries are pruned when new ones are inserted.
 
 Casting:
 - `/api/devices` runs an mDNS browse for `_googlecast._tcp` for 3 seconds. `has_video` drops devices whose `ca` TXT bitmask lacks bit 0 (video out), which removes speakers and speaker groups.
