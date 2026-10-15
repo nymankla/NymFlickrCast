@@ -3,14 +3,14 @@
 
 use rust_cast::channels::heartbeat::HeartbeatResponse;
 use rust_cast::channels::media::{Media, StreamType};
-use rust_cast::channels::receiver::CastDeviceApp;
+use rust_cast::channels::receiver::{Application, CastDeviceApp};
 use rust_cast::{CastDevice, ChannelMessage};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::Read;
-use std::net::{IpAddr, UdpSocket};
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 const API: &str = "https://api.flickr.com/services/rest/";
@@ -37,13 +37,15 @@ static KEY: Mutex<Option<String>> = Mutex::new(None);
 static PHOTOS: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(Default::default);
 /// Album id → photo ids in order, for casting a whole album.
 static ALBUMS: LazyLock<Mutex<HashMap<String, Vec<String>>>> = LazyLock::new(Default::default);
-/// Bumped to start or stop a cast; a running cast stops when it no longer matches.
-static CAST_GEN: AtomicU64 = AtomicU64::new(0);
+/// Mailbox for the cast worker. Only the latest command counts, so quick album clicks collapse into the last one.
+static CAST_CMD: LazyLock<(Mutex<Option<CastCmd>>, Condvar)> = LazyLock::new(Default::default);
+/// Id of the current cast worker; bumped when a stuck one is replaced.
+static CAST_WORKER: AtomicU64 = AtomicU64::new(0);
 static CAST_STATUS: LazyLock<Mutex<Value>> = LazyLock::new(|| Mutex::new(json!({"active": false, "text": ""})));
 /// Port the photo server actually got.
 static MEDIA_PORT_USED: AtomicU16 = AtomicU16::new(MEDIA_PORT);
 /// When the running cast last heard from its device. Pings arrive every ~5 s, so a long silence
-/// means the device is gone (e.g. powered off) and the cast thread's receive() will never return.
+/// means the device is gone (e.g. powered off) and the cast worker's receive() will never return.
 static CAST_LAST_SEEN: LazyLock<Mutex<Instant>> = LazyLock::new(|| Mutex::new(Instant::now()));
 const CAST_SILENCE_LIMIT: Duration = Duration::from_secs(20);
 /// One agent for all Flickr requests: reuses connections, and the timeout stops a stalled download hanging forever.
@@ -79,6 +81,7 @@ Usage: nym_flickr_cast [--port N] [flickr-username-or-NSID]");
         Some(k) => *KEY.lock().unwrap() = Some(k.clone()),
     }
 
+    spawn_cast_worker();
     serve(ui_port, Arc::new(ui_route))?;
     let media: Arc<dyn Fn(&tiny_http::Request) -> Res<Resp> + Send + Sync> = Arc::new(|req| {
         // Logged so you can see whether the Cast device reaches us (firewall issues show up as silence).
@@ -148,13 +151,14 @@ fn ui_route(req: &tiny_http::Request) -> Res<Resp> {
         "/api/status" => json_resp(cast_status()),
         "/api/cast" if post => {
             let ids = ALBUMS.lock().unwrap().get(arg("album")).cloned().ok_or("open the album first")?;
-            let addr: std::net::SocketAddr = arg("device").parse()?;
-            start_cast(addr, arg("name").to_string(), arg("album").to_string(), ids, arg("start").parse().unwrap_or(0));
+            let addr: SocketAddr = arg("device").parse()?;
+            let (name, album) = (arg("name").to_string(), arg("album").to_string());
+            let status = json!({"active": true, "text": format!("Starting on {name}…"), "device": name, "addr": addr.to_string(), "album": album});
+            post_cast_cmd(CastCmd::Play { addr, name, album, ids, start: arg("start").parse().unwrap_or(0) }, status);
             json_resp(json!({"ok": true}))
         }
         "/api/stop" if post => {
-            CAST_GEN.fetch_add(1, Ordering::SeqCst);
-            *CAST_STATUS.lock().unwrap() = json!({"active": false, "text": "Stopped"});
+            post_cast_cmd(CastCmd::Stop, json!({"active": false, "text": "Stopped"}));
             json_resp(json!({"ok": true}))
         }
         _ => text(404, "not found"),
@@ -377,31 +381,27 @@ fn has_video(ca: Option<&str>) -> bool {
     ca.and_then(|c| c.parse::<u64>().ok()).is_none_or(|c| c & 1 != 0)
 }
 
-/// Start a slideshow on a Cast device in the background, replacing any running one.
-/// While active, the status also names the device (`addr`, `device`) and `album`, so the web app can
-/// switch a running cast to another album on the same device.
-fn start_cast(addr: std::net::SocketAddr, name: String, album: String, ids: Vec<String>, start: usize) {
-    let generation = CAST_GEN.fetch_add(1, Ordering::SeqCst) + 1;
-    mark_cast_alive();
-    *CAST_STATUS.lock().unwrap() = json!({"active": true, "text": format!("Connecting to {name}…"), "device": name, "addr": addr.to_string(), "album": album});
-    std::thread::spawn(move || {
-        // A panic would otherwise leave the UI on "Connecting…" forever.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cast_slideshow(addr, &name, &album, &ids, start, generation)))
-            .unwrap_or_else(|_| Err("internal error, see the console".into()));
-        let text = match result {
-            Ok(()) => "Stopped".to_string(),
-            Err(e) => format!("Cast error: {e}"),
-        };
-        set_cast_status(generation, json!({"active": false, "text": text}));
-    });
+/// A command for the cast worker, posted by the web app.
+enum CastCmd {
+    Play { addr: SocketAddr, name: String, album: String, ids: Vec<String>, start: usize },
+    Stop,
 }
 
-/// Status update from a cast thread; dropped if that cast was replaced or stopped meanwhile.
-/// Checked under the status lock, so it can't overwrite what Stop wrote (Stop bumps CAST_GEN first).
-fn set_cast_status(generation: u64, status: Value) {
-    let mut current = CAST_STATUS.lock().unwrap();
-    if CAST_GEN.load(Ordering::SeqCst) == generation {
-        *current = status;
+/// Posts `cmd` to the cast worker, replacing any command it hasn't picked up yet, and shows `status` right away.
+fn post_cast_cmd(cmd: CastCmd, status: Value) {
+    let mut slot = CAST_CMD.0.lock().unwrap();
+    *slot = Some(cmd);
+    *CAST_STATUS.lock().unwrap() = status;
+    mark_cast_alive();
+    CAST_CMD.1.notify_all();
+}
+
+/// Status update from worker `id`; dropped if a newer command is waiting (its status is already shown)
+/// or the worker has been replaced. Lock order: CAST_CMD, then CAST_STATUS.
+fn set_cast_status(id: u64, status: Value) {
+    let pending = CAST_CMD.0.lock().unwrap();
+    if pending.is_none() && CAST_WORKER.load(Ordering::SeqCst) == id {
+        *CAST_STATUS.lock().unwrap() = status;
     }
 }
 
@@ -409,61 +409,139 @@ fn mark_cast_alive() {
     *CAST_LAST_SEEN.lock().unwrap() = Instant::now();
 }
 
-/// Current cast status. A cast whose device has been silent too long is ended here, because its
-/// thread is stuck in receive() and can't report it (that thread is left behind).
+/// Current cast status. A cast whose device has been silent too long is ended here: the worker is
+/// stuck in receive() and can't report it, so it's left behind and a fresh worker takes over.
 fn cast_status() -> Value {
     let mut status = CAST_STATUS.lock().unwrap();
     if status["active"] == true && CAST_LAST_SEEN.lock().unwrap().elapsed() > CAST_SILENCE_LIMIT {
-        CAST_GEN.fetch_add(1, Ordering::SeqCst);
         let device = status["device"].as_str().unwrap_or("the device").to_string();
         *status = json!({"active": false, "text": format!("Lost connection to {device}")});
+        spawn_cast_worker();
     }
     status.clone()
 }
 
-fn cast_slideshow(addr: std::net::SocketAddr, name: &str, album: &str, ids: &[String], start: usize, generation: u64) -> Res<()> {
-    // rust_cast has no connect timeout; fail fast with a clear message when the device is unreachable.
-    let probe = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5))
-        .map_err(|e| format!("can't reach {name} at {addr}: {e}"))?;
-    // Our address on the network that reaches the device (not the default route, which may be a VPN).
-    let base = format!("http://{}:{}", probe.local_addr()?.ip(), MEDIA_PORT_USED.load(Ordering::SeqCst));
-    drop(probe);
-    let dev = CastDevice::connect_without_host_verification(addr.ip().to_string(), addr.port())?;
-    dev.connection.connect("receiver-0")?;
-    dev.heartbeat.ping()?;
-    let app = dev.receiver.launch_app(&CastDeviceApp::DefaultMediaReceiver)?;
-    dev.connection.connect(app.transport_id.as_str())?;
+/// Starts a cast worker; an older one exits (without touching its device) the next time it wakes.
+fn spawn_cast_worker() {
+    let id = CAST_WORKER.fetch_add(1, Ordering::SeqCst) + 1;
+    std::thread::spawn(move || cast_worker(id));
+}
+
+/// Waits for the next command; None once worker `id` has been replaced.
+fn wait_cast_cmd(id: u64) -> Option<CastCmd> {
+    let mut slot = CAST_CMD.0.lock().unwrap();
+    loop {
+        if CAST_WORKER.load(Ordering::SeqCst) != id {
+            return None;
+        }
+        if let Some(cmd) = slot.take() {
+            return Some(cmd);
+        }
+        // Timeout, so a replaced idle worker notices and exits.
+        slot = CAST_CMD.1.wait_timeout(slot, Duration::from_secs(1)).unwrap().0;
+    }
+}
+
+/// A connection to a Cast device with the Default Media Receiver running on it.
+struct CastSession {
+    dev: CastDevice<'static>,
+    app: Application,
+    addr: SocketAddr,
+    /// Photo server URL as the device sees it.
+    base: String,
+}
+
+impl CastSession {
+    fn connect(addr: SocketAddr, name: &str) -> Res<CastSession> {
+        // rust_cast has no connect timeout; fail fast with a clear message when the device is unreachable.
+        let probe = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+            .map_err(|e| format!("can't reach {name} at {addr}: {e}"))?;
+        // Our address on the network that reaches the device (not the default route, which may be a VPN).
+        let base = format!("http://{}:{}", probe.local_addr()?.ip(), MEDIA_PORT_USED.load(Ordering::SeqCst));
+        drop(probe);
+        let dev = CastDevice::connect_without_host_verification(addr.ip().to_string(), addr.port())?;
+        dev.connection.connect("receiver-0")?;
+        dev.heartbeat.ping()?;
+        let app = dev.receiver.launch_app(&CastDeviceApp::DefaultMediaReceiver)?;
+        dev.connection.connect(app.transport_id.as_str())?;
+        Ok(CastSession { dev, app, addr, base })
+    }
+
+    fn stop(self) {
+        let _ = self.dev.receiver.stop_app(self.app.session_id.as_str());
+    }
+}
+
+/// The only thread that talks to Cast devices. It takes commands from CAST_CMD and keeps the
+/// connection and receiver app when only the album changes, so an album switch is just the next photo.
+fn cast_worker(id: u64) {
+    let mut session: Option<CastSession> = None;
+    let mut next = None;
+    loop {
+        let Some(cmd) = next.take().or_else(|| wait_cast_cmd(id)) else { return };
+        match cmd {
+            CastCmd::Stop => if let Some(old) = session.take() { old.stop() },
+            CastCmd::Play { addr, name, album, ids, start } => {
+                // A panic would otherwise kill the worker and leave the UI on "Starting…" forever.
+                let played = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| play(&mut session, id, addr, &name, &album, &ids, start)))
+                    .unwrap_or_else(|_| Err("internal error, see the console".into()));
+                match played {
+                    Ok(Some(cmd)) => next = Some(cmd),
+                    Ok(None) => return, // replaced by a new worker
+                    Err(e) => {
+                        session = None;
+                        set_cast_status(id, json!({"active": false, "text": format!("Cast error: {e}")}));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Shows `ids` on `addr` in a loop until a new command arrives, and returns it (None if this worker was replaced).
+fn play(session: &mut Option<CastSession>, id: u64, addr: SocketAddr, name: &str, album: &str, ids: &[String], start: usize) -> Res<Option<CastCmd>> {
+    if ids.is_empty() {
+        return Err("the album has no photos".into());
+    }
+    if session.as_ref().is_none_or(|s| s.addr != addr) {
+        if let Some(old) = session.take() { old.stop() }
+        *session = Some(CastSession::connect(addr, name)?);
+    }
+    let s = session.as_ref().unwrap();
     for i in (0..ids.len()).cycle().skip(start) {
         let media = Media {
-            content_id: format!("{base}/img/{}", ids[i]),
+            content_id: format!("{}/img/{}", s.base, ids[i]),
             content_type: "image/jpeg".into(),
             stream_type: StreamType::None,
             metadata: None,
             duration: None,
         };
-        dev.media.load(app.transport_id.as_str(), app.session_id.as_str(), &media)?;
+        s.dev.media.load(s.app.transport_id.as_str(), s.app.session_id.as_str(), &media)?;
         mark_cast_alive();
         // Warm the cache with the next photo, so the TV doesn't wait for Flickr on the next slide.
         if let Some(next) = PHOTOS.lock().unwrap().get(&ids[(i + 1) % ids.len()]).cloned() {
             std::thread::spawn(move || { let _ = fetch(&next); });
         }
-        set_cast_status(generation, json!({"active": true, "text": format!("Casting to {name} · {}/{}", i + 1, ids.len()), "device": name, "addr": addr.to_string(), "album": album}));
-        // Keep the connection alive while the photo is shown.
-        // shortcut: receive() blocks until the next message (pings arrive every ~5s), so slides and Stop may lag a few seconds.
+        set_cast_status(id, json!({"active": true, "text": format!("Casting to {name} · {}/{}", i + 1, ids.len()), "device": name, "addr": addr.to_string(), "album": album}));
+        // Keep the connection alive while the photo is shown, and check for new commands.
+        // shortcut: receive() blocks until the next message (pings arrive every ~5s), so slides, album switches
+        // and Stop may lag a few seconds; fixing that needs a Cast client with a read timeout instead of rust_cast.
         let end = Instant::now() + Duration::from_secs(SLIDE_SECS.load(Ordering::SeqCst));
         while Instant::now() < end {
-            if CAST_GEN.load(Ordering::SeqCst) != generation {
-                let _ = dev.receiver.stop_app(app.session_id.as_str());
-                return Ok(());
-            }
-            let msg = dev.receive()?;
+            let msg = s.dev.receive()?;
             mark_cast_alive();
             if let ChannelMessage::Heartbeat(HeartbeatResponse::Ping) = msg {
-                dev.heartbeat.pong()?;
+                s.dev.heartbeat.pong()?;
+            }
+            if CAST_WORKER.load(Ordering::SeqCst) != id {
+                return Ok(None);
+            }
+            if let Some(cmd) = CAST_CMD.0.lock().unwrap().take() {
+                return Ok(Some(cmd));
             }
         }
     }
-    Ok(())
+    unreachable!("cycle over a non-empty list never ends")
 }
 
 fn open_browser(url: &str) {
@@ -516,24 +594,30 @@ mod tests {
         assert_eq!(best_url(&json!({"url_o": "o", "url_q": "q"})), None); // original and thumbnail aren't used
     }
 
-    // One test for all cast status logic, since CAST_GEN/CAST_STATUS are globals shared between tests.
+    // One test for all cast status logic, since CAST_CMD/CAST_STATUS/CAST_WORKER are globals shared between tests.
+    // No worker runs here: commands stay in the mailbox until the test takes them.
     #[test]
     fn cast_status_updates() {
-        let generation = CAST_GEN.fetch_add(1, Ordering::SeqCst) + 1;
-        mark_cast_alive();
-        set_cast_status(generation, json!({"active": true, "text": "Casting", "device": "TV"}));
+        let id = CAST_WORKER.load(Ordering::SeqCst);
+        let tv: SocketAddr = "192.168.1.222:8009".parse().unwrap();
+        let play = || CastCmd::Play { addr: tv, name: "TV".into(), album: "a".into(), ids: vec!["1".into()], start: 0 };
+        post_cast_cmd(play(), json!({"active": true, "text": "Starting on TV…", "device": "TV"}));
+        // While a command waits, the worker's updates from the old cast are dropped.
+        set_cast_status(id, json!({"active": true, "text": "Casting 6/30"}));
+        assert_eq!(cast_status()["text"], "Starting on TV…");
+        // Quick clicks: only the latest command is kept.
+        post_cast_cmd(CastCmd::Stop, json!({"active": false, "text": "Stopped"}));
+        assert!(matches!(CAST_CMD.0.lock().unwrap().take(), Some(CastCmd::Stop)));
+        // Picked up: the worker's updates show again, but not those of a replaced worker.
+        set_cast_status(id, json!({"active": true, "text": "Casting", "device": "TV"}));
         assert_eq!(cast_status()["text"], "Casting");
-        // Stop bumps the generation; a late update from the old cast must not overwrite it.
-        CAST_GEN.fetch_add(1, Ordering::SeqCst);
-        *CAST_STATUS.lock().unwrap() = json!({"active": false, "text": "Stopped"});
-        set_cast_status(generation, json!({"active": true, "text": "Casting 6/30"}));
-        assert_eq!(cast_status()["text"], "Stopped");
-        // A device that has gone silent is reported as lost, and its late updates are dropped.
-        let generation = CAST_GEN.load(Ordering::SeqCst);
-        set_cast_status(generation, json!({"active": true, "text": "Casting", "device": "TV"}));
+        set_cast_status(id + 1, json!({"active": true, "text": "Casting 7/30"}));
+        assert_eq!(cast_status()["text"], "Casting");
+        // A device that has gone silent is reported as lost, a new worker takes over, and the old one is ignored.
         *CAST_LAST_SEEN.lock().unwrap() = Instant::now().checked_sub(CAST_SILENCE_LIMIT + Duration::from_secs(1)).unwrap();
         assert_eq!(cast_status()["text"], "Lost connection to TV");
-        set_cast_status(generation, json!({"active": true, "text": "Casting 7/30"}));
+        assert_eq!(CAST_WORKER.load(Ordering::SeqCst), id + 1);
+        set_cast_status(id, json!({"active": true, "text": "Casting 8/30"}));
         assert_eq!(cast_status()["text"], "Lost connection to TV");
     }
 
