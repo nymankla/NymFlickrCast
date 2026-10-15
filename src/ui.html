@@ -143,12 +143,15 @@ async function openAlbum(a) {
   $('grid').className = 'grid photos'; $('grid').replaceChildren();
   message('Loading photos…');
   try {
-    photos = await api(`/api/photos?user=${encodeURIComponent(nsid)}&album=${encodeURIComponent(a.id)}`);
+    const list = await api(`/api/photos?user=${encodeURIComponent(nsid)}&album=${encodeURIComponent(a.id)}`);
+    if (album !== a) return; // another album was opened meanwhile
+    photos = list;
     message(photos.length ? '' : 'No photos in this album.');
     $('grid').replaceChildren(...photos.map((p, i) => card(p.thumb, null, p.title, () => view(i))));
     updateCastBtn();
     // Keep casting: a running cast switches to this album on the same device.
     const st = await api('/api/status');
+    if (album !== a) return;
     if (st.active && st.addr && st.album !== a.id && photos.length) cast({ addr: st.addr, name: st.device });
   } catch (e) { message(e.message); }
 }
@@ -224,7 +227,7 @@ async function pollStatus() {
     $('status').textContent = s.text;
     $('castBtn').classList.toggle('on', s.active);
     casting = s.active ? s : null; updateCastBtn();
-    if (s.active) statusTimer = setTimeout(pollStatus, 2000);
+    statusTimer = setTimeout(pollStatus, s.active ? 2000 : 10000); // idle: notice casts started elsewhere
   } catch { statusTimer = setTimeout(pollStatus, 5000); }
 }
 

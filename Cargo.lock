@@ -495,7 +495,7 @@ dependencies = [
 
 [[package]]
 name = "nym_flickr_cast"
-version = "0.3.3"
+version = "0.4.1"
 dependencies = [
  "mdns-sd",
  "rust_cast",

@@ -9,12 +9,13 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::Read;
 use std::net::{IpAddr, UdpSocket};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 const API: &str = "https://api.flickr.com/services/rest/";
 const DEFAULT_UI_PORT: u16 = 8080;
+/// Preferred photo server port; a free one is picked if it's taken (the TV gets the URL anyway).
 const MEDIA_PORT: u16 = 8765;
 const KEY_FILE: &str = "secrets/flickrkey.txt";
 // shortcut: in-memory cache (~0.5 GB for a 500-photo album at 2048 px), lost on restart; move to disk if that matters.
@@ -23,7 +24,7 @@ const CACHE_TTL: Duration = Duration::from_secs(2 * 60 * 60);
 const ALBUM_CACHE_TTL: Duration = Duration::from_secs(60);
 
 type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
-type Resp = tiny_http::Response<std::io::Cursor<Vec<u8>>>;
+type Resp = tiny_http::ResponseBox;
 
 /// Seconds per photo, for the cast and the browser preview; set from the web app.
 // shortcut: not saved, back to 8 s on restart; persist it next to the key if that annoys.
@@ -37,6 +38,14 @@ static ALBUMS: LazyLock<Mutex<HashMap<String, Vec<String>>>> = LazyLock::new(Def
 /// Bumped to start or stop a cast; a running cast stops when it no longer matches.
 static CAST_GEN: AtomicU64 = AtomicU64::new(0);
 static CAST_STATUS: LazyLock<Mutex<Value>> = LazyLock::new(|| Mutex::new(json!({"active": false, "text": ""})));
+/// Port the photo server actually got.
+static MEDIA_PORT_USED: AtomicU16 = AtomicU16::new(MEDIA_PORT);
+/// When the running cast last heard from its device. Pings arrive every ~5 s, so a long silence
+/// means the device is gone (e.g. powered off) and the cast thread's receive() will never return.
+static CAST_LAST_SEEN: LazyLock<Mutex<Instant>> = LazyLock::new(|| Mutex::new(Instant::now()));
+const CAST_SILENCE_LIMIT: Duration = Duration::from_secs(20);
+/// One agent for all Flickr requests: reuses connections, and the timeout stops a stalled download hanging forever.
+static HTTP: LazyLock<ureq::Agent> = LazyLock::new(|| ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build());
 
 fn main() -> Res<()> {
     // ureq brings rustls with ring and rust_cast with aws-lc-rs; with both compiled in, rustls
@@ -68,15 +77,20 @@ Usage: nym_flickr_cast [--port N] [flickr-username-or-NSID]");
         Some(k) => *KEY.lock().unwrap() = Some(k.clone()),
     }
 
-    serve(MEDIA_PORT, Arc::new(|req| {
+    serve(ui_port, Arc::new(ui_route))?;
+    let media: Arc<dyn Fn(&tiny_http::Request) -> Res<Resp> + Send + Sync> = Arc::new(|req| {
         // Logged so you can see whether the Cast device reaches us (firewall issues show up as silence).
         println!("media: {} {} {}", req.remote_addr().map(|a| a.to_string()).unwrap_or_default(), req.method(), req.url());
         match req.url().strip_prefix("/img/") {
             Some(id) => photo(id),
             None => Ok(text(404, "not found")),
         }
-    }))?;
-    serve(ui_port, Arc::new(ui_route))?;
+    });
+    let media_port = serve(MEDIA_PORT, media.clone()).or_else(|_| serve(0, media))?;
+    MEDIA_PORT_USED.store(media_port, Ordering::SeqCst);
+    if media_port != MEDIA_PORT {
+        println!("Port {MEDIA_PORT} is busy; the Chromecast photo server uses port {media_port} instead.");
+    }
 
     println!("NymFlickrCast {} running at {url} (Ctrl+C to quit)", env!("CARGO_PKG_VERSION"));
     if let Ok(ip) = local_ip() {
@@ -88,9 +102,10 @@ Usage: nym_flickr_cast [--port N] [flickr-username-or-NSID]");
     }
 }
 
-/// Run an HTTP server on its own thread, one thread per request.
-fn serve(port: u16, handler: Arc<dyn Fn(&tiny_http::Request) -> Res<Resp> + Send + Sync>) -> Res<()> {
+/// Run an HTTP server on its own thread, one thread per request. Returns the port it got (`port` 0 = any free one).
+fn serve(port: u16, handler: Arc<dyn Fn(&tiny_http::Request) -> Res<Resp> + Send + Sync>) -> Res<u16> {
     let server = tiny_http::Server::http(("0.0.0.0", port))?;
+    let port = server.server_addr().to_ip().map_or(port, |a| a.port());
     std::thread::spawn(move || {
         for req in server.incoming_requests() {
             let handler = handler.clone();
@@ -99,12 +114,13 @@ fn serve(port: u16, handler: Arc<dyn Fn(&tiny_http::Request) -> Res<Resp> + Send
                     tiny_http::Response::from_string(json!({"error": e.to_string()}).to_string())
                         .with_status_code(500)
                         .with_header(header("application/json"))
+                        .boxed()
                 });
                 let _ = req.respond(resp);
             });
         }
     });
-    Ok(())
+    Ok(port)
 }
 
 fn ui_route(req: &tiny_http::Request) -> Res<Resp> {
@@ -114,7 +130,7 @@ fn ui_route(req: &tiny_http::Request) -> Res<Resp> {
     let post = *req.method() == tiny_http::Method::Post;
     let key = || KEY.lock().unwrap().clone().ok_or("Flickr API key missing");
     Ok(match path {
-        "/" => tiny_http::Response::from_string(include_str!("ui.html")).with_header(header("text/html; charset=utf-8")),
+        "/" => tiny_http::Response::from_string(include_str!("ui.html")).with_header(header("text/html; charset=utf-8")).boxed(),
         _ if path.starts_with("/img/") => photo(&path[5..])?,
         "/api/config" => json_resp(json!({"version": env!("CARGO_PKG_VERSION"), "needKey": KEY.lock().unwrap().is_none(), "slideSecs": SLIDE_SECS.load(Ordering::SeqCst)})),
         "/api/settings" if post => {
@@ -126,7 +142,7 @@ fn ui_route(req: &tiny_http::Request) -> Res<Resp> {
         "/api/albums" => json_resp(albums(&key()?, arg("user"))?),
         "/api/photos" => json_resp(album_photos(&key()?, arg("user"), arg("album"))?),
         "/api/devices" => json_resp(json!(discover_cast_devices(Duration::from_secs(3)))),
-        "/api/status" => json_resp(CAST_STATUS.lock().unwrap().clone()),
+        "/api/status" => json_resp(cast_status()),
         "/api/cast" if post => {
             let ids = ALBUMS.lock().unwrap().get(arg("album")).cloned().ok_or("open the album first")?;
             let addr: std::net::SocketAddr = arg("device").parse()?;
@@ -150,9 +166,6 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<(u16, Option<Str
             "--port" | "-p" => {
                 let v = args.next().ok_or("--port needs a number")?;
                 port = v.parse().ok().filter(|p| *p != 0).ok_or(format!("invalid port: {v}"))?;
-                if port == MEDIA_PORT {
-                    return Err(format!("port {MEDIA_PORT} is used for the Chromecast photo server"));
-                }
             }
             _ if a.starts_with('-') => return Err(format!("unknown option: {a}")),
             _ if user.is_none() => user = Some(a),
@@ -171,14 +184,7 @@ fn parse_key(text: &str) -> Option<String> {
 
 /// Ok(false) only when Flickr says the key is invalid; network trouble is an Err.
 fn key_valid(key: &str) -> Res<bool> {
-    let v: Value = ureq::get(API)
-        .query("method", "flickr.test.echo")
-        .query("api_key", key)
-        .query("format", "json")
-        .query("nojsoncallback", "1")
-        .call()?
-        .into_json()?;
-    Ok(v["stat"] == "ok")
+    Ok(flickr_raw(key, "flickr.test.echo", &[])?["stat"] == "ok")
 }
 
 /// Key entered in the web app: accepted only while none is set, checked with Flickr, then saved.
@@ -196,8 +202,9 @@ fn set_key(input: &str) -> Res<Value> {
     Ok(json!({"ok": true}))
 }
 
-fn flickr(key: &str, method: &str, params: &[(&str, &str)]) -> Res<Value> {
-    let mut req = ureq::get(API)
+/// Flickr's answer, failing only on network/HTTP errors.
+fn flickr_raw(key: &str, method: &str, params: &[(&str, &str)]) -> Res<Value> {
+    let mut req = HTTP.get(API)
         .query("method", method)
         .query("api_key", key)
         .query("format", "json")
@@ -205,7 +212,12 @@ fn flickr(key: &str, method: &str, params: &[(&str, &str)]) -> Res<Value> {
     for (k, v) in params {
         req = req.query(k, v);
     }
-    let v: Value = req.call()?.into_json()?;
+    Ok(req.call()?.into_json()?)
+}
+
+/// Flickr's answer, also failing when Flickr reports an error.
+fn flickr(key: &str, method: &str, params: &[(&str, &str)]) -> Res<Value> {
+    let v = flickr_raw(key, method, params)?;
     if v["stat"] != "ok" {
         return Err(format!("{method}: {}", v["message"].as_str().unwrap_or("error")).into());
     }
@@ -265,9 +277,7 @@ fn album_photos(key: &str, nsid: &str, album: &str) -> Res<Value> {
             ("per_page", "500"), ("page", &p), ("media", "photos"),
         ])?;
         for ph in r["photoset"]["photo"].as_array().into_iter().flatten() {
-            // Up to 2048 px: a Chromecast shows at most 1920x1080, and bigger files only slow it down.
-            // Sizes above 1024 px are missing when the owner disallows downloads, so fall back.
-            if let (Some(id), Some(u)) = (ph["id"].as_str(), ["url_k", "url_h", "url_l", "url_c", "url_z"].iter().find_map(|k| ph[*k].as_str())) {
+            if let (Some(id), Some(u)) = (ph["id"].as_str(), best_url(ph)) {
                 PHOTOS.lock().unwrap().insert(id.to_string(), u.to_string());
                 photos.push(json!({"id": id, "title": ph["title"], "thumb": ph["url_q"]}));
             }
@@ -282,27 +292,39 @@ fn album_photos(key: &str, nsid: &str, album: &str) -> Res<Value> {
     Ok(json!(photos))
 }
 
+/// Largest photo URL up to 2048 px: a Chromecast shows at most 1920x1080, and bigger files only slow it down.
+/// Sizes above 1024 px are missing when the owner disallows downloads, so fall back.
+fn best_url(ph: &Value) -> Option<&str> {
+    ["url_k", "url_h", "url_l", "url_c", "url_z"].iter().find_map(|k| ph[*k].as_str())
+}
+
 /// Serve a known photo by Flickr id, through the cache.
 fn photo(id: &str) -> Res<Resp> {
     let Some(url) = PHOTOS.lock().unwrap().get(id).cloned() else { return Ok(text(404, "unknown photo")) };
-    Ok(tiny_http::Response::from_data(fetch(&url)?).with_header(header("image/jpeg")))
+    let bytes = fetch(&url)?;
+    let len = bytes.len();
+    // Send Content-Length instead of tiny_http's default chunking above 32 KB; simpler for Cast receivers.
+    Ok(tiny_http::Response::new(200.into(), vec![header("image/jpeg")], std::io::Cursor::new(bytes), Some(len), None)
+        .with_chunked_threshold(usize::MAX)
+        .boxed())
 }
 
-/// Photo bytes by Flickr URL, kept for CACHE_TTL.
-static CACHE: LazyLock<Mutex<HashMap<String, (Instant, Vec<u8>)>>> = LazyLock::new(Default::default);
+/// Photo bytes by Flickr URL, kept for CACHE_TTL. Shared (Arc) so a cache hit doesn't copy the photo.
+static CACHE: LazyLock<Mutex<HashMap<String, (Instant, Arc<[u8]>)>>> = LazyLock::new(Default::default);
 
-fn fetch(url: &str) -> Res<Vec<u8>> {
+fn fetch(url: &str) -> Res<Arc<[u8]>> {
     if let Some((t, bytes)) = CACHE.lock().unwrap().get(url) {
         if t.elapsed() < CACHE_TTL {
             return Ok(bytes.clone());
         }
     }
     let mut buf = Vec::new();
-    ureq::get(url).call()?.into_reader().read_to_end(&mut buf)?;
+    HTTP.get(url).call()?.into_reader().read_to_end(&mut buf)?;
+    let bytes: Arc<[u8]> = buf.into();
     let mut cache = CACHE.lock().unwrap();
     cache.retain(|_, (t, _)| t.elapsed() < CACHE_TTL);
-    cache.insert(url.to_string(), (Instant::now(), buf.clone()));
-    Ok(buf)
+    cache.insert(url.to_string(), (Instant::now(), bytes.clone()));
+    Ok(bytes)
 }
 
 fn header(content_type: &str) -> tiny_http::Header {
@@ -310,14 +332,14 @@ fn header(content_type: &str) -> tiny_http::Header {
 }
 
 fn json_resp(v: Value) -> Resp {
-    tiny_http::Response::from_string(v.to_string()).with_header(header("application/json"))
+    tiny_http::Response::from_string(v.to_string()).with_header(header("application/json")).boxed()
 }
 
 fn text(code: u16, s: &str) -> Resp {
-    tiny_http::Response::from_string(s).with_status_code(code)
+    tiny_http::Response::from_string(s).with_status_code(code).boxed()
 }
 
-/// The LAN address the Chromecast can reach us on (no packet is actually sent).
+/// This PC's address on the network with the default route (no packet is actually sent); only for the startup hint.
 fn local_ip() -> Res<IpAddr> {
     let s = UdpSocket::bind("0.0.0.0:0")?;
     s.connect("8.8.8.8:80")?;
@@ -357,6 +379,7 @@ fn has_video(ca: Option<&str>) -> bool {
 /// switch a running cast to another album on the same device.
 fn start_cast(addr: std::net::SocketAddr, name: String, album: String, ids: Vec<String>, start: usize) {
     let generation = CAST_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    mark_cast_alive();
     *CAST_STATUS.lock().unwrap() = json!({"active": true, "text": format!("Connecting to {name}…"), "device": name, "addr": addr.to_string(), "album": album});
     std::thread::spawn(move || {
         // A panic would otherwise leave the UI on "Connecting…" forever.
@@ -379,11 +402,29 @@ fn set_cast_status(generation: u64, status: Value) {
     }
 }
 
+fn mark_cast_alive() {
+    *CAST_LAST_SEEN.lock().unwrap() = Instant::now();
+}
+
+/// Current cast status. A cast whose device has been silent too long is ended here, because its
+/// thread is stuck in receive() and can't report it (that thread is left behind).
+fn cast_status() -> Value {
+    let mut status = CAST_STATUS.lock().unwrap();
+    if status["active"] == true && CAST_LAST_SEEN.lock().unwrap().elapsed() > CAST_SILENCE_LIMIT {
+        CAST_GEN.fetch_add(1, Ordering::SeqCst);
+        let device = status["device"].as_str().unwrap_or("the device").to_string();
+        *status = json!({"active": false, "text": format!("Lost connection to {device}")});
+    }
+    status.clone()
+}
+
 fn cast_slideshow(addr: std::net::SocketAddr, name: &str, album: &str, ids: &[String], start: usize, generation: u64) -> Res<()> {
-    let base = format!("http://{}:{MEDIA_PORT}", local_ip()?);
     // rust_cast has no connect timeout; fail fast with a clear message when the device is unreachable.
-    std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+    let probe = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5))
         .map_err(|e| format!("can't reach {name} at {addr}: {e}"))?;
+    // Our address on the network that reaches the device (not the default route, which may be a VPN).
+    let base = format!("http://{}:{}", probe.local_addr()?.ip(), MEDIA_PORT_USED.load(Ordering::SeqCst));
+    drop(probe);
     let dev = CastDevice::connect_without_host_verification(addr.ip().to_string(), addr.port())?;
     dev.connection.connect("receiver-0")?;
     dev.heartbeat.ping()?;
@@ -398,6 +439,11 @@ fn cast_slideshow(addr: std::net::SocketAddr, name: &str, album: &str, ids: &[St
             duration: None,
         };
         dev.media.load(app.transport_id.as_str(), app.session_id.as_str(), &media)?;
+        mark_cast_alive();
+        // Warm the cache with the next photo, so the TV doesn't wait for Flickr on the next slide.
+        if let Some(next) = PHOTOS.lock().unwrap().get(&ids[(i + 1) % ids.len()]).cloned() {
+            std::thread::spawn(move || { let _ = fetch(&next); });
+        }
         set_cast_status(generation, json!({"active": true, "text": format!("Casting to {name} · {}/{}", i + 1, ids.len()), "device": name, "addr": addr.to_string(), "album": album}));
         // Keep the connection alive while the photo is shown.
         // shortcut: receive() blocks until the next message (pings arrive every ~5s), so slides and Stop may lag a few seconds.
@@ -407,7 +453,9 @@ fn cast_slideshow(addr: std::net::SocketAddr, name: &str, album: &str, ids: &[St
                 let _ = dev.receiver.stop_app(app.session_id.as_str());
                 return Ok(());
             }
-            if let ChannelMessage::Heartbeat(HeartbeatResponse::Ping) = dev.receive()? {
+            let msg = dev.receive()?;
+            mark_cast_alive();
+            if let ChannelMessage::Heartbeat(HeartbeatResponse::Ping) = msg {
                 dev.heartbeat.pong()?;
             }
         }
@@ -447,7 +495,6 @@ mod tests {
         assert!(p(&["--port"]).is_err());
         assert!(p(&["--port", "abc"]).is_err());
         assert!(p(&["--port", "0"]).is_err());
-        assert!(p(&["--port", "8765"]).is_err());
         assert!(p(&["--bogus"]).is_err());
         assert!(p(&["a", "b"]).is_err());
     }
@@ -457,6 +504,34 @@ mod tests {
         let v = json!({"nsid": "x@N00", "albums": []});
         ALBUM_CACHE.lock().unwrap().insert("cached-user".into(), (Instant::now(), v.clone()));
         assert_eq!(albums("no-key", "cached-user").unwrap(), v); // no Flickr call needed
+    }
+
+    #[test]
+    fn best_photo_size() {
+        assert_eq!(best_url(&json!({"url_k": "k", "url_l": "l"})), Some("k"));
+        assert_eq!(best_url(&json!({"url_l": "l", "url_z": "z"})), Some("l")); // owner blocks > 1024 px
+        assert_eq!(best_url(&json!({"url_o": "o", "url_q": "q"})), None); // original and thumbnail aren't used
+    }
+
+    // One test for all cast status logic, since CAST_GEN/CAST_STATUS are globals shared between tests.
+    #[test]
+    fn cast_status_updates() {
+        let generation = CAST_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+        mark_cast_alive();
+        set_cast_status(generation, json!({"active": true, "text": "Casting", "device": "TV"}));
+        assert_eq!(cast_status()["text"], "Casting");
+        // Stop bumps the generation; a late update from the old cast must not overwrite it.
+        CAST_GEN.fetch_add(1, Ordering::SeqCst);
+        *CAST_STATUS.lock().unwrap() = json!({"active": false, "text": "Stopped"});
+        set_cast_status(generation, json!({"active": true, "text": "Casting 6/30"}));
+        assert_eq!(cast_status()["text"], "Stopped");
+        // A device that has gone silent is reported as lost, and its late updates are dropped.
+        let generation = CAST_GEN.load(Ordering::SeqCst);
+        set_cast_status(generation, json!({"active": true, "text": "Casting", "device": "TV"}));
+        *CAST_LAST_SEEN.lock().unwrap() = Instant::now().checked_sub(CAST_SILENCE_LIMIT + Duration::from_secs(1)).unwrap();
+        assert_eq!(cast_status()["text"], "Lost connection to TV");
+        set_cast_status(generation, json!({"active": true, "text": "Casting 7/30"}));
+        assert_eq!(cast_status()["text"], "Lost connection to TV");
     }
 
     #[test]
@@ -472,10 +547,10 @@ mod tests {
     #[test]
     fn cache_hit_and_expiry() {
         let url = "http://invalid.test/x.jpg";
-        CACHE.lock().unwrap().insert(url.into(), (Instant::now(), vec![1, 2, 3]));
-        assert_eq!(fetch(url).unwrap(), vec![1, 2, 3]); // served without network
+        CACHE.lock().unwrap().insert(url.into(), (Instant::now(), Arc::from([1u8, 2, 3])));
+        assert_eq!(&*fetch(url).unwrap(), &[1, 2, 3]); // served without network
         let old = Instant::now().checked_sub(CACHE_TTL + Duration::from_secs(1)).unwrap();
-        CACHE.lock().unwrap().insert(url.into(), (old, vec![1, 2, 3]));
+        CACHE.lock().unwrap().insert(url.into(), (old, Arc::from([1u8, 2, 3])));
         assert!(fetch(url).is_err()); // expired, so it refetches (and the fake URL fails)
     }
 }
