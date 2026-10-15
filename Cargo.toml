@@ -1,7 +1,11 @@
 [package]
 name = "nym_flickr_cast"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
+description = "Browse Flickr albums in a web app and cast them as a slideshow to Google Cast devices"
+license = "MIT"
+readme = "readme.md"
+authors = ["Klas Nyman"]
 
 [dependencies]
 mdns-sd = "0.21.5"

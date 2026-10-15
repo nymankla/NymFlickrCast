@@ -1,32 +1,77 @@
-# Flickr to Chromcast bridge
+# NymFlickrCast
 
-* The bridge is a Rust app 
-* If possible, when the app start, query avaible, let the user choos from a list of Albums. Sort newest first 
-* To cast media, a Google Cast device doesn't actually receive a video stream from the app. Instead, it is given a URL pointing to a
-media asset, which its internal web browser downloads and plays. 
-* The app can also show the pictures on the computers own screen to be able to preview.
+Show your Flickr albums on a TV. NymFlickrCast is a small Rust app that runs on your computer. It serves a web page where you browse a Flickr user's public albums, preview the photos, and cast an album as a slideshow to a Chromecast or other Google Cast device with a screen.
 
+The web page also works on phones and iPads on the same Wi-Fi, so you can use one as a remote control.
 
-Architecture proposal look like this:
-[ Flickr API ] ──(1. Get Image URLs)──> [ Rust App ] ──(3. Control Slideshow)──┐
-                                               │                                  │
-                                     (2. Host Local Web Server)                   ▼
-                                               │                       [ Google Cast Device ]
-                                               └───────(4. Streams)──────> (Default Receiver)
-1. The Backend / Fetcher: Pulls photo data and image source links from Flickr.
-2. The Local Media Server: Since Flickr's direct photo URLs can sometimes expire or contain restrictive CORS headers, the Rust app
-will run a tiny local HTTP server to proxy or serve the image queue.
-3. The Cast Controller: Discovers Cast devices on your local network and sends the image URLs sequentially to create a slideshow.
+## Features
 
-## Run
+- Albums of any Flickr user, newest first
+- In-browser preview: photo grid, full-screen viewer, swipe and arrow-key navigation, slideshow
+- Casting to Chromecast / Google TV / Nest Hub. Speakers and speaker groups are hidden.
+- Adjustable slideshow delay, shared by the preview and the cast (default 4 s)
+- Opening another album while casting switches the TV to that album
+- Photos up to 2048 px, cached in memory for 2 hours. The album list is cached for 1 minute.
+- A single binary with no other installs. If the API key is missing, the web app asks for it.
+
+## How it works
 
 ```
-cargo run --release -- [--port N] [flickr-username-or-NSID]
+[ Flickr API ] ──(1. photo URLs)──> [ NymFlickrCast ] ──(3. "show this URL")──> [ Google Cast device ]
+                                         │                                      (Default Media Receiver)
+                                    (2. local HTTP server) <──(4. fetches photo)──────────┘
 ```
 
-Needs the Flickr API key in `secrets/flickrkey.txt`. Opens the web app at `http://localhost:8080/` (`--port N` to use another port); the console also prints
-the LAN address to use from a phone or iPad on the same Wi-Fi.
+A Cast device doesn't receive a video stream. It is given a URL and downloads the photo itself. NymFlickrCast therefore runs two small HTTP servers:
 
-* Browse albums (newest first), tap an album for its photos, tap a photo to preview (swipe / arrow keys, ▶ for slideshow).
-* The Cast icon (top right) lists Chromecasts; pick one to cast the open album from the current photo. Tap it again to stop.
-* Ports: 8080 (or `--port`) = web app, 8765 = photo URLs the Chromecast fetches. Windows Firewall must allow both on the private network.
+- **Web app** (port 8080): the page you use, plus a JSON API.
+- **Photo server** (port 8765, or a free port if that one is taken): the Cast device fetches photos from here. The app downloads each photo from Flickr, caches it, and passes it on.
+
+## Requirements
+
+- A Flickr API key. Get one for free at <https://www.flickr.com/services/apps/create/>. The secret isn't needed.
+- To build: Rust 1.85 or newer (edition 2024).
+- To cast: the computer and the Cast device must be on the same network. Your firewall must let other devices on the network reach the app's ports.
+
+## Setup
+
+1. Put your API key in `secrets/flickrkey.txt`. The file can contain just the key, or the key and secret copied from Flickr. See [secrets/README.md](secrets/README.md).
+   If you skip this step, the web app asks for the key on first start and saves it there.
+2. Build and run:
+
+   ```
+   cargo run --release -- [--port N] [flickr-username-or-NSID]
+   ```
+
+   - `--port N` / `-p N`: web app port (default 8080).
+   - The username is optional. Without it, the web app opens the user you last viewed, or the built-in default user (`DEFAULT_USER` in `src/main.rs`).
+
+The browser opens automatically. The console also prints the address to use from a phone or iPad, for example `http://192.168.1.10:8080/`.
+
+On Windows, allow the app through Windows Firewall when asked, on private networks. Otherwise phones can't open the page and the Cast device can't fetch the photos.
+
+## Usage
+
+- **Albums:** click an album to see its photos. Click a photo to open the viewer: swipe or use the arrow keys, ▶ for a slideshow, ⛶ for full screen, Esc to close.
+- **Delay:** the **Delay** field in the album bar sets seconds per photo.
+- **Cast:** the Cast icon (top right) lists the Cast devices it finds. Pick one to cast the open album, starting from the photo you're viewing. Click the icon again to stop.
+
+## Limitations
+
+- Only **public** photos and albums are shown. The app uses an API key, not a Flickr login. Only the first 500 albums of a user are listed.
+- Anyone on your local network who can open the page can control casting. There is no login.
+- The photo cache lives in memory. A large album at 2048 px can use around 0.5 GB, and the cache is empty again after a restart.
+- Slides on the TV can run a few seconds longer than the set delay.
+
+## Development
+
+```
+cargo build
+cargo test
+```
+
+All server code is in `src/main.rs`. The web page is `src/ui.html`, compiled into the binary. [CLAUDE.md](CLAUDE.md) describes the architecture in more detail.
+
+## License
+
+[MIT](LICENSE)

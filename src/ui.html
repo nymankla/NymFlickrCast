@@ -83,7 +83,7 @@
     <p id="keyMsg" role="status"></p>
   </form>
   <div class="bar" id="albumBar" hidden><button id="back">← Albums</button><h2 id="albumTitle"></h2><button id="play">▶ View slideshow</button>
-    <label class="delay">Delay<input id="delay" type="number" min="2" max="3600" step="1" inputmode="numeric" value="8">s</label></div>
+    <label class="delay">Delay<input id="delay" type="number" min="2" max="3600" step="1" inputmode="numeric" value="4">s</label></div>
   <p id="msg">Enter a Flickr username to see the albums.</p>
   <div id="grid" class="grid"></div>
 </main>
@@ -95,7 +95,7 @@
   <div class="count" id="count"></div>
 </div>
 <script>
-let slideMs = 8000;
+let slideMs = 4000;
 const $ = id => document.getElementById(id);
 const store = { get: k => { try { return localStorage.getItem(k) } catch { return null } },
   set: (k, v) => { try { localStorage.setItem(k, v) } catch {} } };
@@ -276,8 +276,9 @@ $('delay').onchange = async () => {
 
 // Ask for whatever the server is missing before loading albums.
 async function start() {
+  let cfg;
   try {
-    const cfg = await api('/api/config');
+    cfg = await api('/api/config');
     showDelay(cfg.slideSecs);
     if (cfg.needKey) {
       $('keyForm').hidden = false; message(''); $('key').focus();
@@ -285,7 +286,7 @@ async function start() {
     }
   } catch (e) { message('Cannot reach the NymFlickrCast server: ' + e.message); return; }
   message('Enter a Flickr username to see the albums.');
-  const initial = new URLSearchParams(location.search).get('user') || store.get('user');
+  const initial = new URLSearchParams(location.search).get('user') || store.get('user') || cfg.defaultUser;
   if (initial) { $('user').value = initial; loadAlbums(initial); }
 }
 start();

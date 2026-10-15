@@ -18,6 +18,8 @@ const DEFAULT_UI_PORT: u16 = 8080;
 /// Preferred photo server port; a free one is picked if it's taken (the TV gets the URL anyway).
 const MEDIA_PORT: u16 = 8765;
 const KEY_FILE: &str = "secrets/flickrkey.txt";
+/// Flickr user shown when none is given (URL/CLI or remembered in the browser).
+const DEFAULT_USER: &str = "Sigtuna_Nym";
 // shortcut: in-memory cache (~0.5 GB for a 500-photo album at 2048 px), lost on restart; move to disk if that matters.
 const CACHE_TTL: Duration = Duration::from_secs(2 * 60 * 60);
 // Short, so albums added on Flickr show up quickly.
@@ -27,8 +29,8 @@ type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 type Resp = tiny_http::ResponseBox;
 
 /// Seconds per photo, for the cast and the browser preview; set from the web app.
-// shortcut: not saved, back to 8 s on restart; persist it next to the key if that annoys.
-static SLIDE_SECS: AtomicU64 = AtomicU64::new(8);
+// shortcut: not saved, back to 4 s on restart; persist it next to the key if that annoys.
+static SLIDE_SECS: AtomicU64 = AtomicU64::new(4);
 /// Flickr API key; None until a valid one is loaded from KEY_FILE or entered in the web app.
 static KEY: Mutex<Option<String>> = Mutex::new(None);
 /// Flickr photo id → large photo URL, filled as albums are opened. Only these are served.
@@ -132,7 +134,7 @@ fn ui_route(req: &tiny_http::Request) -> Res<Resp> {
     Ok(match path {
         "/" => tiny_http::Response::from_string(include_str!("ui.html")).with_header(header("text/html; charset=utf-8")).boxed(),
         _ if path.starts_with("/img/") => photo(&path[5..])?,
-        "/api/config" => json_resp(json!({"version": env!("CARGO_PKG_VERSION"), "needKey": KEY.lock().unwrap().is_none(), "slideSecs": SLIDE_SECS.load(Ordering::SeqCst)})),
+        "/api/config" => json_resp(json!({"version": env!("CARGO_PKG_VERSION"), "defaultUser": DEFAULT_USER, "needKey": KEY.lock().unwrap().is_none(), "slideSecs": SLIDE_SECS.load(Ordering::SeqCst)})),
         "/api/settings" if post => {
             let secs: u64 = arg("slideSecs").parse().map_err(|_| "delay must be a whole number of seconds")?;
             SLIDE_SECS.store(secs.clamp(2, 3600), Ordering::SeqCst);

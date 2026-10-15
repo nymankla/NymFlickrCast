@@ -12,8 +12,8 @@ A Rust bridge from Flickr to Chromecast. It is a single binary that serves a web
 cargo build
 cargo test                          # unit tests (no network needed)
 cargo test cache_hit_and_expiry     # single test
-cargo run --release -- [--port N] [user]   # web app port (default 8080); optional Flickr username or NSID (e.g. 35067687@N04) prefills the UI
-powershell -ExecutionPolicy Bypass -File .\release.ps1   # release build → dist\NymFlickrCast.zip (exe, readme, secrets\ incl. the API key)
+cargo run --release -- [--port N] [user]   # web app port (default 8080); optional Flickr username or NSID prefills the UI (otherwise the browser's last user, else `DEFAULT_USER` Sigtuna_Nym)
+powershell -ExecutionPolicy Bypass -File .\release.ps1   # local-only (gitignored): release build → dist\NymFlickrCast.zip (exe, readme, secrets\ incl. the API key)
 ```
 
 The app needs the Flickr API key in `secrets/flickrkey.txt`. `parse_key` takes the first 32-hex-char token, so the file may also hold labels or the secret. Don't print the contents of this file. `secrets/` is gitignored.
@@ -38,7 +38,7 @@ Data flow and global state (statics in `main.rs`):
 
 Casting:
 - `/api/devices` runs an mDNS browse for `_googlecast._tcp` for 3 seconds. `has_video` drops devices whose `ca` TXT bitmask lacks bit 0 (video out), which removes speakers and speaker groups.
-- `POST /api/cast?device=ip:port&name=&album=&start=` starts `cast_slideshow` on a background thread. It uses `rust_cast` to launch the Default Media Receiver and calls `media.load` for each photo every `SLIDE_SECS` seconds. This is an atomic, default 8 and not saved, set by the web app's Delay field through `POST /api/settings`. It is read again for every slide, so a running cast and the browser preview pick up changes.
+- `POST /api/cast?device=ip:port&name=&album=&start=` starts `cast_slideshow` on a background thread. It uses `rust_cast` to launch the Default Media Receiver and calls `media.load` for each photo every `SLIDE_SECS` seconds. This is an atomic, default 4 and not saved, set by the web app's Delay field through `POST /api/settings`. It is read again for every slide, so a running cast and the browser preview pick up changes.
 - The `CAST_GEN` counter controls start and stop: a new cast or `POST /api/stop` bumps it, and the running cast loop exits when its generation no longer matches.
 - The cast loop must answer heartbeat `Ping`s with `pong()`, or the device drops the connection. `receive()` blocks with no timeout, so a device that goes silent (e.g. powered off) hangs the thread. `cast_status()` handles this: if nothing has been heard for `CAST_SILENCE_LIMIT` (`CAST_LAST_SEEN`), it ends the cast and reports "Lost connection".
 - Two TLS backends are compiled in: ureq uses rustls with ring, and rust_cast uses aws-lc-rs. `main` must install the ring provider before the first TLS connection, or rustls panics inside the cast thread. A panic in the cast thread is caught and reported in `CAST_STATUS`.
