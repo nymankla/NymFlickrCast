@@ -16,13 +16,18 @@ use std::time::{Duration, Instant};
 const API: &str = "https://api.flickr.com/services/rest/";
 const UI_PORT: u16 = 8080;
 const MEDIA_PORT: u16 = 8765;
-const SLIDE_SECS: u64 = 8;
+const KEY_FILE: &str = "secrets/flickrkey.txt";
 // shortcut: in-memory cache (~100-200 MB for a big album), lost on restart; move to disk if that matters.
 const CACHE_TTL: Duration = Duration::from_secs(2 * 60 * 60);
 
 type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 type Resp = tiny_http::Response<std::io::Cursor<Vec<u8>>>;
 
+/// Seconds per photo, for the cast and the browser preview; set from the web app.
+// shortcut: not saved, back to 8 s on restart; persist it next to the key if that annoys.
+static SLIDE_SECS: AtomicU64 = AtomicU64::new(8);
+/// Flickr API key; None until a valid one is loaded from KEY_FILE or entered in the web app.
+static KEY: Mutex<Option<String>> = Mutex::new(None);
 /// Flickr photo id → large photo URL, filled as albums are opened. Only these are served.
 static PHOTOS: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(Default::default);
 /// Album id → photo ids in order, for casting a whole album.
@@ -32,19 +37,37 @@ static CAST_GEN: AtomicU64 = AtomicU64::new(0);
 static CAST_STATUS: LazyLock<Mutex<Value>> = LazyLock::new(|| Mutex::new(json!({"active": false, "text": ""})));
 
 fn main() -> Res<()> {
-    let key = parse_key(&std::fs::read_to_string("secrets/flickrkey.txt")?)
-        .ok_or("no API key found in secrets/flickrkey.txt")?;
-
-    serve(MEDIA_PORT, Arc::new(|req| match req.url().strip_prefix("/img/") {
-        Some(id) => photo(id),
-        None => Ok(text(404, "not found")),
-    }))?;
-    serve(UI_PORT, Arc::new(move |req| ui_route(&key, req)))?;
-
+    // ureq brings rustls with ring and rust_cast with aws-lc-rs; with both compiled in, rustls
+    // can't pick a provider by itself and panics on the first TLS connection to a Cast device.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let mut url = format!("http://localhost:{UI_PORT}/");
     if let Some(user) = std::env::args().nth(1) {
         url += &format!("?user={}", url::form_urlencoded::byte_serialize(user.as_bytes()).collect::<String>());
     }
+    if std::net::TcpListener::bind(("0.0.0.0", UI_PORT)).is_err() {
+        println!("Port {UI_PORT} is in use, so NymFlickrCast is probably already running. Opening {url}");
+        open_browser(&url);
+        return Ok(());
+    }
+
+    // A missing or rejected key doesn't stop the app; the web app asks for one instead.
+    let key = std::fs::read_to_string(KEY_FILE).ok().and_then(|t| parse_key(&t));
+    match &key {
+        None => println!("No Flickr API key in {KEY_FILE}; the web app will ask for one."),
+        Some(k) if matches!(key_valid(k), Ok(false)) => println!("Flickr rejected the key in {KEY_FILE}; the web app will ask for a new one."),
+        Some(k) => *KEY.lock().unwrap() = Some(k.clone()),
+    }
+
+    serve(MEDIA_PORT, Arc::new(|req| {
+        // Logged so you can see whether the Cast device reaches us (firewall issues show up as silence).
+        println!("media: {} {} {}", req.remote_addr().map(|a| a.to_string()).unwrap_or_default(), req.method(), req.url());
+        match req.url().strip_prefix("/img/") {
+            Some(id) => photo(id),
+            None => Ok(text(404, "not found")),
+        }
+    }))?;
+    serve(UI_PORT, Arc::new(ui_route))?;
+
     println!("NymFlickrCast running at {url} (Ctrl+C to quit)");
     if let Ok(ip) = local_ip() {
         println!("On a phone/iPad on the same Wi-Fi: http://{ip}:{UI_PORT}/");
@@ -74,16 +97,24 @@ fn serve(port: u16, handler: Arc<dyn Fn(&tiny_http::Request) -> Res<Resp> + Send
     Ok(())
 }
 
-fn ui_route(key: &str, req: &tiny_http::Request) -> Res<Resp> {
+fn ui_route(req: &tiny_http::Request) -> Res<Resp> {
     let (path, query) = req.url().split_once('?').unwrap_or((req.url(), ""));
     let q: HashMap<String, String> = url::form_urlencoded::parse(query.as_bytes()).into_owned().collect();
     let arg = |k: &str| q.get(k).map(String::as_str).unwrap_or("");
     let post = *req.method() == tiny_http::Method::Post;
+    let key = || KEY.lock().unwrap().clone().ok_or("Flickr API key missing");
     Ok(match path {
         "/" => tiny_http::Response::from_string(include_str!("ui.html")).with_header(header("text/html; charset=utf-8")),
         _ if path.starts_with("/img/") => photo(&path[5..])?,
-        "/api/albums" => json_resp(albums(key, arg("user"))?),
-        "/api/photos" => json_resp(album_photos(key, arg("user"), arg("album"))?),
+        "/api/config" => json_resp(json!({"needKey": KEY.lock().unwrap().is_none(), "slideSecs": SLIDE_SECS.load(Ordering::SeqCst)})),
+        "/api/settings" if post => {
+            let secs: u64 = arg("slideSecs").parse().map_err(|_| "delay must be a whole number of seconds")?;
+            SLIDE_SECS.store(secs.clamp(2, 3600), Ordering::SeqCst);
+            json_resp(json!({"slideSecs": SLIDE_SECS.load(Ordering::SeqCst)}))
+        }
+        "/api/key" if post => json_resp(set_key(arg("key"))?),
+        "/api/albums" => json_resp(albums(&key()?, arg("user"))?),
+        "/api/photos" => json_resp(album_photos(&key()?, arg("user"), arg("album"))?),
         "/api/devices" => json_resp(json!(discover_cast_devices(Duration::from_secs(3)))),
         "/api/status" => json_resp(CAST_STATUS.lock().unwrap().clone()),
         "/api/cast" if post => {
@@ -106,6 +137,33 @@ fn parse_key(text: &str) -> Option<String> {
     text.split(|c: char| !c.is_ascii_hexdigit())
         .find(|t| t.len() == 32)
         .map(str::to_string)
+}
+
+/// Ok(false) only when Flickr says the key is invalid; network trouble is an Err.
+fn key_valid(key: &str) -> Res<bool> {
+    let v: Value = ureq::get(API)
+        .query("method", "flickr.test.echo")
+        .query("api_key", key)
+        .query("format", "json")
+        .query("nojsoncallback", "1")
+        .call()?
+        .into_json()?;
+    Ok(v["stat"] == "ok")
+}
+
+/// Key entered in the web app: accepted only while none is set, checked with Flickr, then saved.
+fn set_key(input: &str) -> Res<Value> {
+    if KEY.lock().unwrap().is_some() {
+        return Err("an API key is already set".into());
+    }
+    let key = parse_key(input).ok_or("that doesn't look like a Flickr API key (32 letters/digits, 0-9 a-f)")?;
+    if !key_valid(&key)? {
+        return Err("Flickr rejected that key".into());
+    }
+    std::fs::create_dir_all("secrets")?;
+    std::fs::write(KEY_FILE, &key)?;
+    *KEY.lock().unwrap() = Some(key);
+    Ok(json!({"ok": true}))
 }
 
 fn flickr(key: &str, method: &str, params: &[(&str, &str)]) -> Res<Value> {
@@ -226,6 +284,9 @@ fn discover_cast_devices(wait: Duration) -> Vec<Value> {
     let end = Instant::now() + wait;
     while let Ok(ev) = rx.recv_timeout(end.saturating_duration_since(Instant::now())) {
         if let mdns_sd::ServiceEvent::ServiceResolved(s) = ev {
+            if !has_video(s.txt_properties.get_property_val_str("ca")) {
+                continue;
+            }
             let name = s.txt_properties.get_property_val_str("fn").unwrap_or(&s.fullname).to_string();
             if let Some(ip) = s.get_addresses_v4().into_iter().next() {
                 if !found.iter().any(|d| d["name"] == name) {
@@ -238,20 +299,35 @@ fn discover_cast_devices(wait: Duration) -> Vec<Value> {
     found
 }
 
+/// Cast devices advertise capabilities in the `ca` TXT bitmask; bit 0 = video out.
+/// Speakers and speaker groups lack it. A device that doesn't advertise `ca` is kept.
+fn has_video(ca: Option<&str>) -> bool {
+    ca.and_then(|c| c.parse::<u64>().ok()).is_none_or(|c| c & 1 != 0)
+}
+
 /// Start a slideshow on a Cast device in the background, replacing any running one.
 fn start_cast(addr: std::net::SocketAddr, name: String, ids: Vec<String>, start: usize) {
     let generation = CAST_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     *CAST_STATUS.lock().unwrap() = json!({"active": true, "text": format!("Connecting to {name}…")});
     std::thread::spawn(move || {
-        let result = cast_slideshow(addr, &name, &ids, start, generation);
-        if CAST_GEN.load(Ordering::SeqCst) == generation {
-            let text = match result {
-                Ok(()) => "Stopped".to_string(),
-                Err(e) => format!("Cast error: {e}"),
-            };
-            *CAST_STATUS.lock().unwrap() = json!({"active": false, "text": text});
-        }
+        // A panic would otherwise leave the UI on "Connecting…" forever.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cast_slideshow(addr, &name, &ids, start, generation)))
+            .unwrap_or_else(|_| Err("internal error, see the console".into()));
+        let text = match result {
+            Ok(()) => "Stopped".to_string(),
+            Err(e) => format!("Cast error: {e}"),
+        };
+        set_cast_status(generation, json!({"active": false, "text": text}));
     });
+}
+
+/// Status update from a cast thread; dropped if that cast was replaced or stopped meanwhile.
+/// Checked under the status lock, so it can't overwrite what Stop wrote (Stop bumps CAST_GEN first).
+fn set_cast_status(generation: u64, status: Value) {
+    let mut current = CAST_STATUS.lock().unwrap();
+    if CAST_GEN.load(Ordering::SeqCst) == generation {
+        *current = status;
+    }
 }
 
 fn cast_slideshow(addr: std::net::SocketAddr, name: &str, ids: &[String], start: usize, generation: u64) -> Res<()> {
@@ -270,10 +346,10 @@ fn cast_slideshow(addr: std::net::SocketAddr, name: &str, ids: &[String], start:
             duration: None,
         };
         dev.media.load(app.transport_id.as_str(), app.session_id.as_str(), &media)?;
-        *CAST_STATUS.lock().unwrap() = json!({"active": true, "text": format!("Casting to {name} · {}/{}", i + 1, ids.len()), "device": name});
+        set_cast_status(generation, json!({"active": true, "text": format!("Casting to {name} · {}/{}", i + 1, ids.len()), "device": name}));
         // Keep the connection alive while the photo is shown.
         // shortcut: receive() blocks until the next message (pings arrive every ~5s), so slides and Stop may lag a few seconds.
-        let end = Instant::now() + Duration::from_secs(SLIDE_SECS);
+        let end = Instant::now() + Duration::from_secs(SLIDE_SECS.load(Ordering::SeqCst));
         while Instant::now() < end {
             if CAST_GEN.load(Ordering::SeqCst) != generation {
                 let _ = dev.receiver.stop_app(app.session_id.as_str());
@@ -308,6 +384,16 @@ mod tests {
         assert_eq!(parse_key("nothing here"), None);
         assert_eq!(num(&serde_json::json!("42")), 42);
         assert_eq!(num(&serde_json::json!(7)), 7);
+    }
+
+    #[test]
+    fn video_capable_devices() {
+        assert!(has_video(Some("465413"))); // Chromecast
+        assert!(has_video(Some("231941"))); // Nest Hub (has a screen)
+        assert!(!has_video(Some("199172"))); // Nest Audio / Google Home
+        assert!(!has_video(Some("198660"))); // Nest Mini
+        assert!(!has_video(Some("199204"))); // speaker group
+        assert!(has_video(None));
     }
 
     #[test]

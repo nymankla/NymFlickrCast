@@ -13,11 +13,12 @@ cargo build
 cargo test                          # unit tests (no network needed)
 cargo test cache_hit_and_expiry     # single test
 cargo run --release -- [user]       # optional Flickr username or NSID (e.g. 35067687@N04) prefills the UI
+powershell -ExecutionPolicy Bypass -File .\release.ps1   # release build → dist\NymFlickrCast.zip (exe, readme, secrets\ incl. the API key)
 ```
 
 The app needs the Flickr API key in `secrets/flickrkey.txt`. `parse_key` takes the first 32-hex-char token, so the file may also hold labels or the secret. Don't print the contents of this file. `secrets/` is gitignored.
 
-The app runs until killed. A running instance holds both ports, so a second launch fails with `AddrInUse` (os error 10048).
+The app runs until killed. It shouldn't exit because something is missing at startup; it asks in the web app instead. If the key is missing or Flickr rejects it, `KEY` stays `None`, `/api/config` reports `needKey`, and `ui.html` shows a key form that posts to `/api/key`, which checks the key with Flickr and saves it to `KEY_FILE`. If port 8080 is already in use, the app assumes it is already running, opens the browser on it and exits.
 
 ## Architecture
 
@@ -35,10 +36,13 @@ Data flow and global state (statics in `main.rs`):
 - `fetch` keeps an in-memory `CACHE` of photo bytes for 2 hours (`CACHE_TTL`). Expired entries are pruned when new ones are inserted.
 
 Casting:
-- `/api/devices` runs an mDNS browse for `_googlecast._tcp` for 3 seconds.
-- `POST /api/cast?device=ip:port&name=&album=&start=` starts `cast_slideshow` on a background thread. It uses `rust_cast` to launch the Default Media Receiver and calls `media.load` for each photo every `SLIDE_SECS` (8 s).
+- `/api/devices` runs an mDNS browse for `_googlecast._tcp` for 3 seconds. `has_video` drops devices whose `ca` TXT bitmask lacks bit 0 (video out), which removes speakers and speaker groups.
+- `POST /api/cast?device=ip:port&name=&album=&start=` starts `cast_slideshow` on a background thread. It uses `rust_cast` to launch the Default Media Receiver and calls `media.load` for each photo every `SLIDE_SECS` seconds. This is an atomic, default 8 and not saved, set by the web app's Delay field through `POST /api/settings`. It is read again for every slide, so a running cast and the browser preview pick up changes.
 - The `CAST_GEN` counter controls start and stop: a new cast or `POST /api/stop` bumps it, and the running cast loop exits when its generation no longer matches.
 - The cast loop must answer heartbeat `Ping`s with `pong()`, or the device drops the connection.
+- Two TLS backends are compiled in: ureq uses rustls with ring, and rust_cast uses aws-lc-rs. `main` must install the ring provider before the first TLS connection, or rustls panics inside the cast thread. A panic in the cast thread is caught and reported in `CAST_STATUS`.
+- Cast threads update the status only through `set_cast_status`, which drops updates from a cast that has been stopped or replaced.
+- The media server logs each request (`media: <ip> GET /img/..`). If a cast's photos never show and there's no log line from the TV's IP, the firewall is blocking it.
 - `CAST_STATUS` holds the JSON that the UI polls at `/api/status`.
 
 Flickr access uses an API key only, with no OAuth. Only public albums are visible, and only the first 500 albums are listed. Flickr returns some numbers as strings, so read numeric fields with `num()`.

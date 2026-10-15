@@ -32,6 +32,8 @@
   main { padding:16px }
   .bar { display:flex; gap:12px; align-items:center; margin-bottom:14px }
   .bar h2 { margin:0; font-size:18px }
+  .delay { color:var(--muted); white-space:nowrap }
+  #delay { flex:none; width:5.5em; margin:0 4px }
   .grid { display:grid; gap:12px; grid-template-columns:repeat(auto-fill, minmax(160px, 1fr)) }
   .card { background:var(--panel); border-radius:8px; overflow:hidden; cursor:pointer; border:1px solid transparent; padding:0; text-align:left }
   .card:hover, .card:focus-visible { border-color:var(--accent) }
@@ -53,6 +55,11 @@
     form { order:3; flex:1 1 100% } input { flex:1 }
     .bar { flex-wrap:wrap }
   }
+  #keyForm { display:block; max-width:520px; margin:24px auto; background:var(--panel); padding:16px 20px; border-radius:8px }
+  #keyForm h2 { margin:0 0 8px; font-size:18px }
+  #keyForm input { width:100%; margin:8px 0 }
+  #keyForm a { color:var(--accent) }
+  #keyMsg { color:var(--accent); min-height:1.4em; margin:6px 0 0 }
   [hidden] { display:none !important }
 </style>
 </head>
@@ -67,7 +74,16 @@
   <div id="menu" hidden></div>
 </header>
 <main>
-  <div class="bar" id="albumBar" hidden><button id="back">← Albums</button><h2 id="albumTitle"></h2><button id="play">▶ Preview slideshow</button></div>
+  <form id="keyForm" hidden>
+    <h2>Flickr API key needed</h2>
+    <p>No valid key was found in <code>secrets/flickrkey.txt</code>. Paste your Flickr API key (the 32-character "Key", not the secret).
+      Get one at <a href="https://www.flickr.com/services/apps/create/" target="_blank" rel="noopener">flickr.com/services/apps/create</a>.</p>
+    <input id="key" autocomplete="off" spellcheck="false" placeholder="0123456789abcdef0123456789abcdef" aria-label="Flickr API key">
+    <button>Save key</button>
+    <p id="keyMsg" role="status"></p>
+  </form>
+  <div class="bar" id="albumBar" hidden><button id="back">← Albums</button><h2 id="albumTitle"></h2><button id="play">▶ Preview slideshow</button>
+    <label class="delay">Delay<input id="delay" type="number" min="2" max="3600" step="1" inputmode="numeric" value="8">s</label></div>
   <p id="msg">Enter a Flickr username to see the albums.</p>
   <div id="grid" class="grid"></div>
 </main>
@@ -79,7 +95,7 @@
   <div class="count" id="count"></div>
 </div>
 <script>
-const SLIDE_MS = 8000;
+let slideMs = 8000;
 const $ = id => document.getElementById(id);
 const store = { get: k => { try { return localStorage.getItem(k) } catch { return null } },
   set: (k, v) => { try { localStorage.setItem(k, v) } catch {} } };
@@ -142,7 +158,7 @@ function view(i) {
   $('count').textContent = `${idx + 1} / ${photos.length}`;
 }
 function setPlaying(on) {
-  clearInterval(timer); timer = on ? setInterval(() => view(idx + 1), SLIDE_MS) : null;
+  clearInterval(timer); timer = on ? setInterval(() => view(idx + 1), slideMs) : null;
   $('slide').textContent = on ? '❚❚ Pause' : '▶ Play';
 }
 function closeViewer() { setPlaying(false); $('viewer').hidden = true; }
@@ -214,8 +230,39 @@ document.onkeydown = e => {
   else if (e.key === ' ') { e.preventDefault(); setPlaying(!timer); }
 };
 
-const initial = new URLSearchParams(location.search).get('user') || store.get('user');
-if (initial) { $('user').value = initial; loadAlbums(initial); }
+$('keyForm').onsubmit = async e => {
+  e.preventDefault();
+  $('keyMsg').textContent = 'Checking key with Flickr…';
+  try {
+    await api('/api/key?key=' + encodeURIComponent($('key').value.trim()), { method: 'POST' });
+    $('keyForm').hidden = true;
+    start();
+  } catch (err) { $('keyMsg').textContent = err.message; }
+};
+
+function showDelay(secs) { slideMs = secs * 1000; $('delay').value = secs; }
+$('delay').onchange = async () => {
+  try {
+    showDelay((await api('/api/settings?slideSecs=' + Math.round(+$('delay').value), { method: 'POST' })).slideSecs);
+    if (timer) setPlaying(true);
+  } catch (e) { $('status').textContent = e.message; }
+};
+
+// Ask for whatever the server is missing before loading albums.
+async function start() {
+  try {
+    const cfg = await api('/api/config');
+    showDelay(cfg.slideSecs);
+    if (cfg.needKey) {
+      $('keyForm').hidden = false; message(''); $('key').focus();
+      return;
+    }
+  } catch (e) { message('Cannot reach the NymFlickrCast server: ' + e.message); return; }
+  message('Enter a Flickr username to see the albums.');
+  const initial = new URLSearchParams(location.search).get('user') || store.get('user');
+  if (initial) { $('user').value = initial; loadAlbums(initial); }
+}
+start();
 pollStatus();
 </script>
 </body>

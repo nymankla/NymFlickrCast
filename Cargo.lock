@@ -499,6 +499,7 @@ version = "0.1.0"
 dependencies = [
  "mdns-sd",
  "rust_cast",
+ "rustls",
  "serde",
  "serde_json",
  "tiny_http",
