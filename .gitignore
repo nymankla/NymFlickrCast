@@ -2,3 +2,4 @@
 secrets/*
 !secrets/README.md
 dist/
+release.ps1
