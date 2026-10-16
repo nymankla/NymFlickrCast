@@ -56,14 +56,20 @@ fn main() -> Res<()> {
     // ureq brings rustls with ring and rust_cast with aws-lc-rs; with both compiled in, rustls
     // can't pick a provider by itself and panics on the first TLS connection to a Cast device.
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let (ui_port, user) = match parse_args(std::env::args().skip(1)) {
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // Added by install-service.ps1: run under the Windows service manager instead of from a console.
+    let service = args.iter().position(|a| a == "--service").map(|i| args.remove(i)).is_some();
+    let (ui_port, user) = match parse_args(args.into_iter()) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("{e}
-Usage: nym_flickr_cast [--port N] [flickr-username-or-NSID]");
+Usage: nym_flickr_cast [--port N] [--service] [flickr-username-or-NSID]");
             std::process::exit(2);
         }
     };
+    if service {
+        return run_service(ui_port);
+    }
     let mut url = format!("http://localhost:{ui_port}/");
     if let Some(user) = user {
         url += &format!("?user={}", url::form_urlencoded::byte_serialize(user.as_bytes()).collect::<String>());
@@ -73,7 +79,19 @@ Usage: nym_flickr_cast [--port N] [flickr-username-or-NSID]");
         open_browser(&url);
         return Ok(());
     }
+    start(ui_port)?;
+    println!("NymFlickrCast {} running at {url} (Ctrl+C to quit)", env!("CARGO_PKG_VERSION"));
+    if let Ok(ip) = local_ip() {
+        println!("On a phone/iPad on the same Wi-Fi: http://{ip}:{ui_port}/");
+    }
+    open_browser(&url);
+    loop {
+        std::thread::park();
+    }
+}
 
+/// Loads the key and starts the cast worker and both servers, which run on background threads.
+fn start(ui_port: u16) -> Res<()> {
     // A missing or rejected key doesn't stop the app; the web app asks for one instead.
     let key = std::fs::read_to_string(KEY_FILE).ok().and_then(|t| parse_key(&t));
     match &key {
@@ -97,14 +115,78 @@ Usage: nym_flickr_cast [--port N] [flickr-username-or-NSID]");
     if media_port != MEDIA_PORT {
         println!("Port {MEDIA_PORT} is busy; the Chromecast photo server uses port {media_port} instead.");
     }
+    Ok(())
+}
 
-    println!("NymFlickrCast {} running at {url} (Ctrl+C to quit)", env!("CARGO_PKG_VERSION"));
-    if let Ok(ip) = local_ip() {
-        println!("On a phone/iPad on the same Wi-Fi: http://{ip}:{ui_port}/");
+#[cfg(windows)]
+fn run_service(ui_port: u16) -> Res<()> {
+    // Services start in System32; secrets\ is next to the exe.
+    let exe = std::env::current_exe()?;
+    std::env::set_current_dir(exe.parent().ok_or("the exe has no folder")?)?;
+    service::PORT.store(ui_port, Ordering::SeqCst);
+    service::dispatch()?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn run_service(_ui_port: u16) -> Res<()> {
+    Err("--service is only supported on Windows".into())
+}
+
+/// Windows service mode (`--service`), registered by install-service.ps1.
+// shortcut: a service has no console, so log lines are lost; write them to a file or the event log if you need them.
+#[cfg(windows)]
+mod service {
+    use std::sync::atomic::{AtomicU16, Ordering};
+    use std::time::Duration;
+    use windows_service::service::{ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType};
+    use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
+
+    pub const NAME: &str = "NymFlickrCast";
+    /// Web app port, from the command line (the service manager passes its own arguments to service_main).
+    pub static PORT: AtomicU16 = AtomicU16::new(0);
+    windows_service::define_windows_service!(ffi_service_main, service_main);
+
+    /// Hands this thread to the service manager until the service stops; fails when not started by it.
+    pub fn dispatch() -> windows_service::Result<()> {
+        windows_service::service_dispatcher::start(NAME, ffi_service_main)
     }
-    open_browser(&url);
-    loop {
-        std::thread::park();
+
+    fn service_main(_args: Vec<std::ffi::OsString>) {
+        let _ = run();
+    }
+
+    fn run() -> crate::Res<()> {
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        let handle = service_control_handler::register(NAME, move |control| match control {
+            ServiceControl::Stop | ServiceControl::Shutdown => {
+                let _ = stop_tx.send(());
+                ServiceControlHandlerResult::NoError
+            }
+            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+            _ => ServiceControlHandlerResult::NotImplemented,
+        })?;
+        let status = |state: ServiceState, exit: u32| ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: state,
+            controls_accepted: if state == ServiceState::Running { ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN } else { ServiceControlAccept::empty() },
+            exit_code: ServiceExitCode::Win32(exit),
+            checkpoint: 0,
+            wait_hint: Duration::ZERO,
+            process_id: None,
+        };
+        // Running first: start() checks the key with Flickr, which can take longer than the service manager waits.
+        handle.set_service_status(status(ServiceState::Running, 0))?;
+        // All state is in memory, so stopping is just reporting Stopped; the process exits after that.
+        let exit = match crate::start(PORT.load(Ordering::SeqCst)) {
+            Ok(()) => {
+                let _ = stop_rx.recv();
+                0
+            }
+            Err(_) => 1, // e.g. the port is taken
+        };
+        handle.set_service_status(status(ServiceState::Stopped, exit))?;
+        Ok(())
     }
 }
 

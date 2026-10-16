@@ -33,7 +33,7 @@ jobs:
         run: |
           $stage = 'NymFlickrCast'
           New-Item -ItemType Directory "$stage/secrets" | Out-Null
-          Copy-Item target/release/nym_flickr_cast.exe, readme.md, LICENSE $stage
+          Copy-Item target/release/nym_flickr_cast.exe, readme.md, LICENSE, install-service.ps1 $stage
           Copy-Item secrets/README.md "$stage/secrets"
           Compress-Archive $stage "NymFlickrCast-$env:GITHUB_REF_NAME-windows-x64.zip"
 

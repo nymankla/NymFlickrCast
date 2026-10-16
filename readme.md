@@ -60,6 +60,22 @@ On Windows, allow the app through Windows Firewall when asked, on private networ
 - **Delay:** the **Delay** field in the album bar sets seconds per photo.
 - **Cast:** the Cast icon (top right) lists the Cast devices it finds. Pick one to cast the open album, starting from the photo you're viewing. Click the icon again to stop.
 
+## Run as a Windows service
+
+To have NymFlickrCast start with Windows and run with no one logged in:
+
+1. Move the unzipped folder somewhere permanent, for example `C:\Program Files\NymFlickrCast`. The service runs the exe from there and keeps the API key in its `secrets` folder.
+2. In PowerShell **as administrator**, in that folder:
+
+   ```
+   powershell -ExecutionPolicy Bypass -File .\install-service.ps1 [-Port 8080]
+   ```
+
+   This registers the service (delayed automatic start, restarts if it crashes), allows the app through Windows Firewall on private networks, and starts it.
+3. Open `http://localhost:8080/`, or the PC's address from a phone.
+
+To remove it: `.\install-service.ps1 -Uninstall`. A service has no console window, so the log lines aren't shown.
+
 ## Limitations
 
 - Only **public** photos and albums are shown. The app uses an API key, not a Flickr login. Only the first 500 albums of a user are listed.

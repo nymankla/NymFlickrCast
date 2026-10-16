@@ -141,29 +141,34 @@ async function openCastMenu() {
   const m = $('menu');
   if (!m.hidden) { m.hidden = true; return; }
   m.hidden = false;
-  m.innerHTML = '<p>Searching for Cast devices…</p>';
+  /** @param {string} t */
+  const note = t => { const p = document.createElement('p'); p.textContent = t; return p; };
+  m.replaceChildren(note('Searching for Cast devices…'));
   /** @type {HTMLElement[]} */
-  const items = [];
+  const top = [];
   const st = /** @type {CastStatus} */ (await api('/api/status'));
   if (st.active) {
     const stop = document.createElement('button');
-    stop.textContent = '■ Stop casting';
+    stop.className = 'stop';
+    stop.textContent = '■ Stop casting' + (st.device ? ' to ' + st.device : '');
     stop.onclick = async () => { m.hidden = true; await api('/api/stop', { method: 'POST' }); pollStatus(); };
-    items.push(stop);
+    top.push(stop);
   }
-  if (!album || !photos.length) {
-    const p = document.createElement('p'); p.textContent = 'Open an album to cast it.'; items.push(p);
-  } else try {
+  if (!album || !photos.length) { m.replaceChildren(...top, note('Open an album to cast it.')); return; }
+  m.replaceChildren(...top, note('Searching for Cast devices…')); // Stop is usable during the ~3 s search
+  /** @type {HTMLElement[]} */
+  const items = [];
+  try {
     const devs = /** @type {Device[]} */ (await api('/api/devices'));
-    if (!devs.length) { const p = document.createElement('p'); p.textContent = 'No Cast devices found.'; items.push(p); }
+    if (!devs.length) items.push(note('No Cast devices found.'));
     for (const d of devs) {
       const b = document.createElement('button');
-      b.textContent = '📺 ' + d.name;
+      b.textContent = (st.active && st.addr === d.addr ? '✓ ' : '📺 ') + d.name;
       b.onclick = () => cast(d);
       items.push(b);
     }
-  } catch (e) { const p = document.createElement('p'); p.textContent = errText(e); items.push(p); }
-  m.replaceChildren(...items);
+  } catch (e) { items.push(note(errText(e))); }
+  m.replaceChildren(...top, ...items);
 }
 
 /** Casts the open album to `d`, from the photo in the viewer if it's open. @param {Device} d */

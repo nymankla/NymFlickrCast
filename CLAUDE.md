@@ -21,6 +21,8 @@ The app needs the Flickr API key in `secrets/flickrkey.txt`. `parse_key` takes t
 
 The app runs until killed. It shouldn't exit because something is missing at startup; it asks in the web app instead. If the key is missing or Flickr rejects it, `KEY` stays `None`, `/api/config` reports `needKey`, and `ui.html` shows a key form that posts to `/api/key`, which checks the key with Flickr and saves it to `KEY_FILE`. If the web app port is already in use, the app assumes it is already running, opens the browser on it and exits.
 
+`--service` runs the app under the Windows service manager (`service` module, `windows-service` crate). `install-service.ps1` (admin; `-Port`, `-Uninstall`) registers the service with that flag and adds the firewall rule. In this mode the working directory is changed to the exe's folder (services start in System32, and `KEY_FILE` is relative), no browser is opened, and there's no console. `main` and service mode share `start()`, which starts the cast worker and both servers. The service reports Running before `start()`, because the key check with Flickr can take longer than the service manager waits.
+
 ## Architecture
 
 All Rust code is in `src/main.rs`. The UI is `src/ui.html` (markup and CSS) plus `src/ui.js` (vanilla JS, served at `/ui.js`). Both are embedded with `include_str!`, so a rebuild is needed after editing them. There's no build step: `ui.js` uses `// @ts-check` with JSDoc types, which VS Code checks. The `@typedef`s at its top mirror the `json!` shapes in `main.rs`, so keep them in sync when an API response changes.
