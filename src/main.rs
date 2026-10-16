@@ -1,9 +1,10 @@
 //! Flickr → Chromecast bridge. A web app (`--port`, default 8080) to browse albums, preview them
 //! and cast them; a media server (MEDIA_PORT) the Chromecast fetches photos from.
 
+use rust_cast::channels::connection::ConnectionResponse;
 use rust_cast::channels::heartbeat::HeartbeatResponse;
-use rust_cast::channels::media::{Media, StreamType};
-use rust_cast::channels::receiver::{Application, CastDeviceApp};
+use rust_cast::channels::media::{IdleReason, Media, MediaResponse, StreamType};
+use rust_cast::channels::receiver::{Application, CastDeviceApp, ReceiverResponse};
 use rust_cast::{CastDevice, ChannelMessage};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -498,6 +499,21 @@ fn cast_worker(id: u64) {
     }
 }
 
+/// True if `msg` says the photo was stopped on the device (Back on the TV remote).
+fn cancelled_on_device(msg: &ChannelMessage) -> bool {
+    matches!(msg, ChannelMessage::Media(MediaResponse::Status(st)) if st.entries.iter().any(|e| e.idle_reason == Some(IdleReason::Cancelled)))
+}
+
+/// True if `msg` hints that our app has closed (Home on the TV remote, or another app took over). Only a hint:
+/// rust_cast hands over messages it held back while launching, such as an older status from before our app started.
+fn app_maybe_closed(msg: &ChannelMessage, session_id: &str) -> bool {
+    match msg {
+        ChannelMessage::Connection(ConnectionResponse::Close) => true,
+        ChannelMessage::Receiver(ReceiverResponse::Status(st)) => !st.applications.iter().any(|a| a.session_id == session_id),
+        _ => false,
+    }
+}
+
 /// Shows `ids` on `addr` in a loop until a new command arrives, and returns it (None if this worker was replaced).
 fn play(session: &mut Option<CastSession>, id: u64, addr: SocketAddr, name: &str, album: &str, ids: &[String], start: usize) -> Res<Option<CastCmd>> {
     if ids.is_empty() {
@@ -532,6 +548,14 @@ fn play(session: &mut Option<CastSession>, id: u64, addr: SocketAddr, name: &str
             mark_cast_alive();
             if let ChannelMessage::Heartbeat(HeartbeatResponse::Ping) = msg {
                 s.dev.heartbeat.pong()?;
+            } else if cancelled_on_device(&msg)
+                || (app_maybe_closed(&msg, &s.app.session_id)
+                    && !s.dev.receiver.get_status()?.applications.iter().any(|a| a.session_id == s.app.session_id))
+            {
+                // Back/Home on the TV remote: stop for real (not just pause until the next slide), so the TV can leave the app.
+                println!("cast: stopped on {name}: {msg:?}");
+                set_cast_status(id, json!({"active": false, "text": format!("Stopped on {name}")}));
+                return Ok(Some(CastCmd::Stop));
             }
             if CAST_WORKER.load(Ordering::SeqCst) != id {
                 return Ok(None);
@@ -596,6 +620,13 @@ mod tests {
 
     // One test for all cast status logic, since CAST_CMD/CAST_STATUS/CAST_WORKER are globals shared between tests.
     // No worker runs here: commands stay in the mailbox until the test takes them.
+    #[test]
+    fn stop_from_tv_remote() {
+        assert!(app_maybe_closed(&ChannelMessage::Connection(ConnectionResponse::Close), "s1"));
+        assert!(!app_maybe_closed(&ChannelMessage::Heartbeat(HeartbeatResponse::Ping), "s1"));
+        assert!(!cancelled_on_device(&ChannelMessage::Heartbeat(HeartbeatResponse::Ping)));
+    }
+
     #[test]
     fn cast_status_updates() {
         let id = CAST_WORKER.load(Ordering::SeqCst);
