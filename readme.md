@@ -79,8 +79,8 @@ To remove it: `.\install-service.ps1 -Uninstall`. A service has no console windo
 ## Limitations
 
 - Only **public** photos and albums are shown. The app uses an API key, not a Flickr login. Only the first 500 albums of a user are listed.
-- Anyone on your local network who can open the page can control casting. There is no login.
-- The photo cache lives in memory. A large album at 2048 px can use around 0.5 GB, and the cache is empty again after a restart.
+- Anyone on your local network who can open the page can control casting. There is no login. Other websites you visit can't control it.
+- The photo cache lives in memory, up to about 768 MB (roughly 1000 photos at 2048 px), and is empty again after a restart.
 - Slides on the TV can run a few seconds longer than the set delay.
 
 ## Development

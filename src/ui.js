@@ -12,6 +12,8 @@
 /** @typedef {HTMLElement & {webkitRequestFullscreen?: () => void}} WebkitElement */
 
 let slideMs = 4000;
+/** Server error when no valid key is set (`KEY_MISSING` in main.rs). */
+const KEY_MISSING = 'Flickr API key missing';
 /** @param {string} id */
 const $ = id => /** @type {HTMLElement} */ (document.getElementById(id));
 /** @param {string} id */
@@ -35,8 +37,11 @@ let nsid = '', idx = 0;
  * @returns {Promise<any>}
  */
 async function api(path, opts) {
-  const r = await fetch(path, opts);
-  const j = await r.json();
+  // The server rejects POSTs without this header; other sites can't add it (see API_HEADER in main.rs).
+  const r = await fetch(path, { ...opts, headers: { 'X-NymFlickrCast': '1' } });
+  const body = await r.text();
+  /** @type {any} */ let j;
+  try { j = JSON.parse(body); } catch { j = { error: body || r.statusText }; } // e.g. a plain-text 403/404
   if (!r.ok) throw new Error(j.error || r.statusText);
   return j;
 }
@@ -81,7 +86,10 @@ async function loadAlbums(user) {
     message(r.albums.length ? '' : 'No public albums.');
     $('grid').replaceChildren(...r.albums.map(a => card(a.thumb, a.title,
       `${a.count} photos · ${new Date(a.created * 1000).toLocaleDateString()}`, () => openAlbum(a))));
-  } catch (e) { message(errText(e)); }
+  } catch (e) {
+    // Flickr rejected the saved key after startup: ask for a new one.
+    if (errText(e) === KEY_MISSING) start(); else message(errText(e));
+  }
 }
 
 /** @param {Album} a */

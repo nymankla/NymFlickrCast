@@ -1,0 +1,39 @@
+# Lints and tests on every push and pull request. Lint settings live in Cargo.toml ([lints]),
+# rustfmt.toml and jsconfig.json, so the same checks run locally with the commands below.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  rust:
+    strategy:
+      matrix:
+        # Windows is what ships (and has the service module); Linux checks the non-Windows build.
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup component add clippy rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
+  ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # Strict type check of src/ui.js via its JSDoc types (see jsconfig.json).
+      - run: npx --yes -p typescript@5.9.2 tsc -p jsconfig.json
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # Known vulnerabilities in the dependencies (RustSec advisory database).
+      - run: cargo audit
