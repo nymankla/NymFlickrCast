@@ -13,6 +13,7 @@ cargo build
 cargo test                          # unit tests (no network needed)
 cargo test cache_hit_and_expiry     # single test
 cargo run --release -- [--port N] [user]   # web app port (default 8080); optional Flickr username or NSID prefills the UI (otherwise the browser's last user, else `DEFAULT_USER` Sigtuna_Nym)
+git tag vX.Y.Z && git push origin vX.Y.Z   # .github/workflows/release.yml: tests, builds and publishes a GitHub release (Windows zip without the API key); the tag must match Cargo.toml's version
 powershell -ExecutionPolicy Bypass -File .\release.ps1   # local-only (gitignored): release build → dist\NymFlickrCast.zip (exe, readme, secrets\ incl. the API key)
 ```
 

@@ -33,7 +33,11 @@ A Cast device doesn't receive a video stream. It is given a URL and downloads th
 - To build: Rust 1.85 or newer (edition 2024).
 - To cast: the computer and the Cast device must be on the same network. Your firewall must let other devices on the network reach the app's ports.
 
-## Setup
+## Download
+
+Windows builds are on the [Releases page](https://github.com/nymankla/NymFlickrCast/releases/latest). Unzip and run `nym_flickr_cast.exe`. The web app asks for your Flickr API key on first start.
+
+## Build from source
 
 1. Put your API key in `secrets/flickrkey.txt`. The file can contain just the key, or the key and secret copied from Flickr. See [secrets/README.md](secrets/README.md).
    If you skip this step, the web app asks for the key on first start and saves it there.

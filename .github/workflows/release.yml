@@ -1,0 +1,44 @@
+# Pushing a version tag (e.g. `git tag v0.6.0 && git push origin v0.6.0`) builds the Windows exe
+# and publishes a GitHub release with a zip to download. The tag must match the version in Cargo.toml.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write # create the release
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tag matches Cargo.toml version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -1) # .* also drops a CRLF checkout's \r
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME doesn't match Cargo.toml version $version"
+            exit 1
+          fi
+
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+
+      # Same layout as release.ps1, but without the API key: the app asks for it on first start.
+      - name: Package
+        shell: pwsh
+        run: |
+          $stage = 'NymFlickrCast'
+          New-Item -ItemType Directory "$stage/secrets" | Out-Null
+          Copy-Item target/release/nym_flickr_cast.exe, readme.md, LICENSE $stage
+          Copy-Item secrets/README.md "$stage/secrets"
+          Compress-Archive $stage "NymFlickrCast-$env:GITHUB_REF_NAME-windows-x64.zip"
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" NymFlickrCast-*.zip --title "NymFlickrCast $GITHUB_REF_NAME" --generate-notes
