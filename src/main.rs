@@ -31,7 +31,7 @@ const HTTP_WORKERS: usize = 16;
 /// Header the web app sends with every API call. A page on another site can't add it to a request
 /// without CORS permission, which the server never gives, so it can't POST to the API (CSRF).
 const API_HEADER: &str = "X-NymFlickrCast";
-/// Error text the web app recognises to show the key form again (`KEY_MISSING` in ui.js).
+/// Error text the web app recognises to show the key form again (`KEY_MISSING` in ui.ts).
 const KEY_MISSING: &str = "Flickr API key missing";
 // Short, so albums added on Flickr show up quickly.
 const ALBUM_CACHE_TTL: Duration = Duration::from_secs(60);

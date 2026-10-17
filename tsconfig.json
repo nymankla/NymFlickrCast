@@ -1,0 +1,14 @@
+{
+  // Compiles src/ui.ts to src/ui.js, which is committed so `cargo build` needs no Node. CI checks it is up to date.
+  "compilerOptions": {
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "newLine": "lf"
+  },
+  "include": ["src/ui.ts"]
+}

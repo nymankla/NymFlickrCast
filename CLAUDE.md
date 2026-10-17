@@ -13,7 +13,7 @@ cargo build
 cargo test                          # unit tests (no network needed)
 cargo test cache_hit_and_expiry     # single test
 cargo fmt && cargo clippy --all-targets -- -D warnings   # lints: [lints] in Cargo.toml (clippy pedantic + extras, unsafe_code forbidden), rustfmt.toml (140 cols)
-npx -p typescript tsc -p jsconfig.json   # strict type check of src/ui.js (JSDoc); VS Code shows the same
+npx -p typescript@5.9.2 tsc            # strict type check of src/ui.ts and compile to src/ui.js (tsconfig.json); run after every ui.ts edit
 # CI (.github/workflows/ci.yml) runs all of the above plus cargo audit on Windows and Linux for every push/PR.
 cargo run --release -- [--port N] [user]   # web app port (default 8080); optional Flickr username or NSID prefills the UI (otherwise the browser's last user, else `DEFAULT_USER` Sigtuna_Nym)
 git tag vX.Y.Z && git push origin vX.Y.Z   # .github/workflows/release.yml: tests, builds and publishes a GitHub release (Windows zip without the API key); the tag must match Cargo.toml's version
@@ -22,18 +22,18 @@ powershell -ExecutionPolicy Bypass -File .\release.ps1   # local-only (gitignore
 
 The app needs the Flickr API key in `secrets/flickrkey.txt`. `parse_key` takes the first 32-hex-char token, so the file may also hold labels or the secret. Don't print the contents of this file. `secrets/` is gitignored.
 
-The app runs until killed. It shouldn't exit because something is missing at startup; it asks in the web app instead. At startup a key from the file is used right away and checked with Flickr in the background, so a slow or offline Flickr doesn't delay startup. If the key is missing or Flickr rejects it, `KEY` is `None`, `/api/config` reports `needKey`, and `ui.html` shows a key form that posts to `/api/key`, which checks the key with Flickr and saves it to `KEY_FILE`. When the background check rejects a key after the page has loaded, the next album request fails with `KEY_MISSING`, and `ui.js` shows the key form again. If the web app port is already in use, the app assumes it is already running, opens the browser on it and exits.
+The app runs until killed. It shouldn't exit because something is missing at startup; it asks in the web app instead. At startup a key from the file is used right away and checked with Flickr in the background, so a slow or offline Flickr doesn't delay startup. If the key is missing or Flickr rejects it, `KEY` is `None`, `/api/config` reports `needKey`, and `ui.html` shows a key form that posts to `/api/key`, which checks the key with Flickr and saves it to `KEY_FILE`. When the background check rejects a key after the page has loaded, the next album request fails with `KEY_MISSING`, and `ui.ts` shows the key form again. If the web app port is already in use, the app assumes it is already running, opens the browser on it and exits.
 
 `--service` runs the app under the Windows service manager (`service` module, `windows-service` crate). `install-service.ps1` (admin; `-Port`, `-Uninstall`) registers the service with that flag and adds the firewall rule. In this mode the working directory is changed to the exe's folder (services start in System32, and `KEY_FILE` is relative), no browser is opened, and there's no console. `main` and service mode share `start()`, which starts the cast worker and both servers. The service reports Running once `start()` has bound the ports.
 
 ## Architecture
 
-All Rust code is in `src/main.rs`. The UI is `src/ui.html` (markup and CSS) plus `src/ui.js` (vanilla JS, served at `/ui.js`). Both are embedded with `include_str!`, so a rebuild is needed after editing them. There's no build step: `ui.js` uses `// @ts-check` with JSDoc types, which VS Code checks. The `@typedef`s at its top mirror the `json!` shapes in `main.rs`, so keep them in sync when an API response changes.
+All Rust code is in `src/main.rs`. The UI is `src/ui.html` (markup and CSS) plus `src/ui.ts` (vanilla TypeScript, no framework). `tsc` compiles it to `src/ui.js`, which is committed so `cargo build` needs no Node; CI fails if it is stale. Never edit `ui.js` by hand. `ui.html` and `ui.js` are embedded with `include_str!` and served at `/` and `/ui.js`, so a rebuild is needed after editing them. The types at the top of `ui.ts` mirror `main.rs`: the response interfaces match its `json!` shapes, `Routes` lists every endpoint with its response (and `POST_ROUTES` the POST ones), and `Els` lists the element ids in `ui.html` with their types. Keep them in sync when an endpoint, response or element id changes.
 
 Two `tiny_http` servers, both bound to `0.0.0.0` so phones and iPads on the LAN can reach them. Each has a fixed pool of `HTTP_WORKERS` threads (`serve`); a handler panic is answered with a 500 and the worker keeps going:
 - **Web app port** (`--port`, default 8080): the page `/`, the JSON API `/api/*`, and `/img/<photo id>` for the in-app preview. Two checks protect it from other web pages, since there's no login:
   - `host_allowed` rejects a `Host` that isn't an IP address, a single-label name (localhost, the PC's name) or a local suffix such as `.local`. This blocks DNS rebinding.
-  - POSTs must carry the `X-NymFlickrCast` header (`API_HEADER`), which `api()` in `ui.js` always sends. A cross-site page can't add it without CORS permission, which the app never gives, so this blocks CSRF.
+  - POSTs must carry the `X-NymFlickrCast` header (`API_HEADER`), which `api()` in `ui.ts` always sends. A cross-site page can't add it without CORS permission, which the app never gives, so this blocks CSRF.
 - **Photo server** (`MEDIA_PORT` 8765, or any free port if 8765 is taken, kept in `MEDIA_PORT_USED`): only `/img/<photo id>`. The Chromecast fetches photos from here. The host in that URL is the local address of a probe connection to the Cast device, not `local_ip()`: the default route can be a VPN the TV can't reach. The UI server binds first, so `--port 8765` works too.
 
 Data flow and global state (statics in `main.rs`):
