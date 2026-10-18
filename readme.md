@@ -9,7 +9,7 @@ The web page also works on phones and iPads on the same Wi-Fi, so you can use on
 - Albums of any Flickr user, newest first
 - In-browser preview: photo grid, full-screen viewer, swipe and arrow-key navigation, slideshow
 - Casting to Chromecast / Google TV / Nest Hub. Speakers and speaker groups are hidden.
-- Adjustable slideshow delay, shared by the preview and the cast (default 4 s)
+- Adjustable slideshow delay, shared by the preview and the cast (default 4 s), saved in `settings.json` next to the app
 - Opening another album while casting switches the TV to that album
 - Photos up to 2048 px, cached in memory for 2 hours. The album list is cached for 1 minute.
 - A single binary with no other installs. If the API key is missing, the web app asks for it.

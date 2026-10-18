@@ -3,3 +3,4 @@ secrets/*
 !secrets/README.md
 dist/
 release.ps1
+settings.json

@@ -18,6 +18,8 @@ const DEFAULT_UI_PORT: u16 = 8080;
 /// Preferred photo server port; a free one is picked if it's taken (the TV gets the URL anyway).
 const MEDIA_PORT: u16 = 8765;
 const KEY_FILE: &str = "secrets/flickrkey.txt";
+/// Settings set in the web app (the slide delay), kept across restarts.
+const SETTINGS_FILE: &str = "settings.json";
 /// Flickr user shown when none is given (URL/CLI or remembered in the browser).
 const DEFAULT_USER: &str = "Sigtuna_Nym";
 // shortcut: in-memory photo cache, lost on restart; move to disk if that matters.
@@ -40,8 +42,7 @@ type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 type Resp = tiny_http::ResponseBox;
 type Handler = Arc<dyn Fn(&tiny_http::Request) -> Res<Resp> + Send + Sync>;
 
-/// Seconds per photo, for the cast and the browser preview; set from the web app.
-// shortcut: not saved, back to 4 s on restart; persist it next to the key if that annoys.
+/// Seconds per photo, for the cast and the browser preview; set from the web app and saved in `SETTINGS_FILE`.
 static SLIDE_SECS: AtomicU64 = AtomicU64::new(4);
 /// Flickr API key; None until a valid one is loaded from `KEY_FILE` or entered in the web app.
 static KEY: Mutex<Option<String>> = Mutex::new(None);
@@ -60,6 +61,10 @@ static MEDIA_PORT_USED: AtomicU16 = AtomicU16::new(MEDIA_PORT);
 /// means the device is gone (e.g. powered off) and the cast worker's `receive()` will never return.
 static CAST_LAST_SEEN: LazyLock<Mutex<Instant>> = LazyLock::new(|| Mutex::new(Instant::now()));
 const CAST_SILENCE_LIMIT: Duration = Duration::from_secs(20);
+/// A command still waiting this long wasn't picked up: a live device pings every ~5 s, which wakes the worker.
+const CAST_PICKUP_LIMIT: Duration = Duration::from_secs(10);
+/// Extra time allowed while a device launches the receiver app, which can be slow (e.g. a TV waking up).
+const CAST_LAUNCH_GRACE: Duration = Duration::from_secs(40);
 /// One agent for all Flickr requests: reuses connections, and the timeout stops a stalled download hanging forever.
 static HTTP: LazyLock<ureq::Agent> =
     LazyLock::new(|| ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(30))).build().into());
@@ -109,6 +114,7 @@ Usage: nym_flickr_cast [--port N] [--service] [flickr-username-or-NSID]"
 
 /// Loads the key and starts the cast worker and both servers, which run on background threads.
 fn start(ui_port: u16) -> Res<()> {
+    load_settings(SETTINGS_FILE);
     // A missing or rejected key doesn't stop the app; the web app asks for one instead.
     match std::fs::read_to_string(KEY_FILE).ok().and_then(|t| parse_key(&t)) {
         None => println!("No Flickr API key in {KEY_FILE}; the web app will ask for one."),
@@ -281,7 +287,11 @@ fn ui_route(req: &tiny_http::Request) -> Res<Resp> {
         return Ok(text(403, "missing API header"));
     }
     Ok(match path {
-        "/" => tiny_http::Response::from_string(include_str!("ui.html")).with_header(header("text/html; charset=utf-8")).boxed(),
+        "/" => tiny_http::Response::from_string(include_str!("ui.html"))
+            .with_header(header("text/html; charset=utf-8"))
+            // No framing by other sites, which could trick clicks on the page (clickjacking).
+            .with_header(tiny_http::Header::from_bytes("X-Frame-Options", "DENY").unwrap())
+            .boxed(),
         "/ui.js" => tiny_http::Response::from_string(include_str!("ui.js")).with_header(header("text/javascript; charset=utf-8")).boxed(),
         _ if path.starts_with("/img/") => photo(&path[5..])?,
         "/api/config" => json_resp(
@@ -289,7 +299,7 @@ fn ui_route(req: &tiny_http::Request) -> Res<Resp> {
         ),
         "/api/settings" if post => {
             let secs: u64 = arg("slideSecs").parse().map_err(|_| "delay must be a whole number of seconds")?;
-            SLIDE_SECS.store(secs.clamp(2, 3600), Ordering::SeqCst);
+            set_slide_secs(secs, SETTINGS_FILE);
             json_resp(&json!({"slideSecs": SLIDE_SECS.load(Ordering::SeqCst)}))
         }
         "/api/key" if post => json_resp(&set_key(arg("key"))?),
@@ -300,7 +310,8 @@ fn ui_route(req: &tiny_http::Request) -> Res<Resp> {
         "/api/cast" if post => {
             let ids = lock(&ALBUMS).get(arg("album")).cloned().ok_or("open the album first")?;
             let addr: SocketAddr = arg("device").parse()?;
-            let (name, album) = (arg("name").to_owned(), arg("album").to_owned());
+            let name = known_device(addr).ok_or("unknown Cast device; open the cast menu again")?;
+            let album = arg("album").to_owned();
             let status =
                 json!({"active": true, "text": format!("Starting on {name}…"), "device": name, "addr": addr.to_string(), "album": album});
             post_cast_cmd(CastCmd::Play { addr, name, album, ids, start: arg("start").parse().unwrap_or(0) }, status);
@@ -334,6 +345,23 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<(u16, Option<Str
 /// The key file may hold labels/secret too; the API key is the 32-hex-char token.
 fn parse_key(text: &str) -> Option<String> {
     text.split(|c: char| !c.is_ascii_hexdigit()).find(|t| t.len() == 32).map(str::to_owned)
+}
+
+/// Loads the saved settings from `path`, if any.
+fn load_settings(path: &str) {
+    let saved = std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok());
+    if let Some(secs) = saved.and_then(|v| v["slideSecs"].as_u64()) {
+        SLIDE_SECS.store(secs.clamp(2, 3600), Ordering::SeqCst);
+    }
+}
+
+/// Sets the slide delay (clamped to 2 s .. 1 h) and saves it to `path`. A failed save only loses it at the next restart.
+fn set_slide_secs(secs: u64, path: &str) {
+    let secs = secs.clamp(2, 3600);
+    SLIDE_SECS.store(secs, Ordering::SeqCst);
+    if let Err(e) = std::fs::write(path, json!({"slideSecs": secs}).to_string()) {
+        println!("Can't save {path}: {e}");
+    }
 }
 
 /// Ok(false) only when Flickr says the key is invalid; network trouble is an Err.
@@ -606,6 +634,12 @@ fn cast_devices(wait: Duration) -> Vec<Value> {
     }
 }
 
+/// Name of the discovered Cast device at `addr`. Casting is limited to these, so the app connects to nothing else.
+fn known_device(addr: SocketAddr) -> Option<String> {
+    let addr = addr.to_string();
+    lock(&DEVICES).values().find(|d| d["addr"] == addr.as_str()).and_then(|d| d["name"].as_str()).map(str::to_owned)
+}
+
 /// Cast devices advertise capabilities in the `ca` TXT bitmask; bit 0 = video out.
 /// Speakers and speaker groups lack it. A device that doesn't advertise `ca` is kept.
 fn has_video(ca: Option<&str>) -> bool {
@@ -640,9 +674,19 @@ fn mark_cast_alive() {
     *lock(&CAST_LAST_SEEN) = Instant::now();
 }
 
-/// Current cast status. A cast whose device has been silent too long is ended here: the worker is
-/// stuck in `receive()` and can't report it, so it's left behind and a fresh worker takes over.
+/// Current cast status. A worker stuck in `receive()` on a device that went silent can't notice that itself,
+/// so it's left behind here and a fresh worker takes over:
+/// - a command it hasn't picked up in time goes to the new worker (e.g. switching away from a TV that was turned off);
+/// - a cast whose device has been silent too long is ended.
 fn cast_status() -> Value {
+    {
+        let pending = lock(&CAST_CMD.0);
+        let mut last_seen = lock(&CAST_LAST_SEEN);
+        if pending.is_some() && last_seen.elapsed() > CAST_PICKUP_LIMIT {
+            *last_seen = Instant::now(); // the new worker gets its own time
+            spawn_cast_worker();
+        }
+    }
     let mut status = lock(&CAST_STATUS);
     if status["active"] == true && lock(&CAST_LAST_SEEN).elapsed() > CAST_SILENCE_LIMIT {
         let device = status["device"].as_str().unwrap_or("the device").to_owned();
@@ -693,13 +737,22 @@ impl CastSession {
         let dev = CastDevice::connect_without_host_verification(addr.ip().to_string(), addr.port())?;
         dev.connection.connect("receiver-0")?;
         dev.heartbeat.ping()?;
+        // The device answered; give it extra time to launch the app before it counts as silent.
+        *lock(&CAST_LAST_SEEN) = Instant::now() + CAST_LAUNCH_GRACE;
         let app = dev.receiver.launch_app(&CastDeviceApp::DefaultMediaReceiver)?;
         dev.connection.connect(app.transport_id.as_str())?;
         Ok(Self { dev, app, addr, base })
     }
 
+    /// Stops the app, giving up after a few seconds: on a device that went silent (e.g. turned off) the
+    /// answer never comes, and waiting for it would block the next cast. The abandoned thread just leaks.
     fn stop(self) {
-        let _ = self.dev.receiver.stop_app(self.app.session_id.as_str());
+        let (done, wait) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = self.dev.receiver.stop_app(self.app.session_id.as_str());
+            let _ = done.send(());
+        });
+        let _ = wait.recv_timeout(Duration::from_secs(5));
     }
 }
 
@@ -900,6 +953,35 @@ mod tests {
         assert_eq!(CAST_WORKER.load(Ordering::SeqCst), id + 1);
         set_cast_status(id, json!({"active": true, "text": "Casting 8/30"}));
         assert_eq!(cast_status()["text"], "Lost connection to TV");
+        // A command the stuck worker doesn't pick up goes to a new worker, and its status stays.
+        post_cast_cmd(play(), json!({"active": true, "text": "Starting on TV…", "device": "TV"}));
+        assert_eq!(CAST_WORKER.load(Ordering::SeqCst), id + 1); // not yet: the worker may still wake for it
+        *lock(&CAST_LAST_SEEN) = Instant::now().checked_sub(CAST_PICKUP_LIMIT + Duration::from_secs(1)).unwrap();
+        assert_eq!(cast_status()["text"], "Starting on TV…");
+        assert_eq!(CAST_WORKER.load(Ordering::SeqCst), id + 2);
+        assert!(lock(&CAST_CMD.0).take().is_some()); // still there for the new worker
+    }
+
+    #[test]
+    fn only_known_devices() {
+        let tv: SocketAddr = "192.168.1.250:8009".parse().unwrap();
+        assert_eq!(known_device(tv), None);
+        lock(&DEVICES).insert("tv-test".into(), json!({"name": "Test TV", "addr": "192.168.1.250:8009"}));
+        assert_eq!(known_device(tv).as_deref(), Some("Test TV"));
+        assert_eq!(known_device("192.168.1.250:8010".parse().unwrap()), None);
+    }
+
+    #[test]
+    fn settings_saved() {
+        let path = std::env::temp_dir().join(format!("nfc-settings-{}.json", std::process::id()));
+        let path = path.to_str().unwrap();
+        set_slide_secs(1, path); // clamped to 2
+        SLIDE_SECS.store(4, Ordering::SeqCst);
+        load_settings(path);
+        assert_eq!(SLIDE_SECS.load(Ordering::SeqCst), 2);
+        std::fs::remove_file(path).unwrap();
+        load_settings(path); // a missing file keeps the current value
+        assert_eq!(SLIDE_SECS.load(Ordering::SeqCst), 2);
     }
 
     #[test]

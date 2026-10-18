@@ -576,7 +576,7 @@ checksum = "521739c6d2bac4aa25192232afe6841231376b2b26d4d9fae5ecf8ca5772e441"
 
 [[package]]
 name = "nym_flickr_cast"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "form_urlencoded",
  "mdns-sd",

@@ -159,12 +159,17 @@ async function openCastMenu() {
   const note = (t: string) => { const p = document.createElement('p'); p.textContent = t; return p; };
   m.replaceChildren(note('Searching for Cast devices…'));
   const top: HTMLElement[] = [];
-  const st = await api('/api/status');
+  let st: CastStatus;
+  try { st = await api('/api/status'); } catch (e) { m.replaceChildren(note(errText(e))); return; }
   if (st.active) {
     const stop = document.createElement('button');
     stop.className = 'stop';
     stop.textContent = '■ Stop casting to ' + st.device;
-    stop.onclick = async () => { m.hidden = true; await api('/api/stop'); pollStatus(); };
+    stop.onclick = async () => {
+      m.hidden = true;
+      try { await api('/api/stop'); } catch (e) { $('status').textContent = errText(e); }
+      pollStatus();
+    };
     top.push(stop);
   }
   if (!album || !photos.length) { m.replaceChildren(...top, note('Open an album to cast it.')); return; }
@@ -188,7 +193,7 @@ async function cast(d: Device) {
   $('menu').hidden = true;
   if (!album) return;
   const start = $('viewer').hidden ? 0 : idx;
-  try { await api('/api/cast', { device: d.addr, name: d.name, album: album.id, start: String(start) }); }
+  try { await api('/api/cast', { device: d.addr, album: album.id, start: String(start) }); }
   catch (e) { $('status').textContent = errText(e); }
   pollStatus();
 }
@@ -206,7 +211,7 @@ async function pollStatus() {
 
 $('userForm').onsubmit = e => { e.preventDefault(); const u = $('user').value.trim(); if (u) loadAlbums(u); };
 $('back').onclick = () => loadAlbums(store.get('user') || $('user').value);
-$('play').onclick = () => { view(idx); setPlaying(true); };
+$('play').onclick = () => { if (photos.length) { view(idx); setPlaying(true); } };
 $('prev').onclick = () => view(idx - 1);
 $('next').onclick = () => view(idx + 1);
 $('slide').onclick = () => setPlaying(!timer);
